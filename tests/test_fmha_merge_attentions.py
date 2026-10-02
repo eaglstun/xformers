@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 import hashlib
 import math
 from typing import Callable, List, Optional, Tuple, Type
@@ -10,14 +12,17 @@ from typing import Callable, List, Optional, Tuple, Type
 import pytest
 import torch
 from xformers.ops import fmha
-from xformers.ops.fmha.common import AttentionFwOpBase
-from xformers.ops.fmha.merge_training import (
-    memory_efficient_attention_partial_autograd,
-    merge_attentions_autograd,
-    Partial,
-)
+from xformers.ops.fmha._backend import HAS_MSLK
 
 from .utils import assert_allclose, disable_on_rocm
+
+if HAS_MSLK:
+    from xformers.ops.fmha.common import AttentionFwOpBase
+    from xformers.ops.fmha.merge_training import (
+        memory_efficient_attention_partial_autograd,
+        merge_attentions_autograd,
+        Partial,
+    )
 
 compute_capability = (0, 0)
 if torch.cuda.is_available():
@@ -27,6 +32,26 @@ sm80_or_better_only = pytest.mark.skipif(
 )
 sm90_or_better_only = pytest.mark.skipif(
     compute_capability < (9, 0), reason="requires sm90+"
+)
+
+# Without mslk (e.g. on macOS), the op=None tests run on the CPU against the
+# PyTorch SDPA fallback's merge_attentions / memory_efficient_attention_partial.
+DEVICE = "cuda" if HAS_MSLK else "cpu"
+# Same as sm80_or_better_only (reason text included) when mslk is installed.
+sm80_or_better_or_fallback = pytest.mark.skipif(
+    HAS_MSLK and compute_capability < (8, 0), reason="requires sm90+"
+)
+needs_mslk_ops = pytest.mark.skipif(
+    not HAS_MSLK,
+    reason="parametrized over mslk attention operators (triton_splitk/flash); "
+    "the SDPA fallback has no op= selection",
+)
+needs_flash3 = pytest.mark.skipif(
+    not HAS_MSLK, reason="uses mslk's fmha.flash3 operator"
+)
+needs_merge_training = pytest.mark.skipif(
+    not HAS_MSLK,
+    reason="xformers.ops.fmha.merge_training (differentiable merge) is mslk-only",
 )
 
 
@@ -59,15 +84,19 @@ def get_supported_attn_bias_types(op):
 
 
 @disable_on_rocm
-@sm80_or_better_only
+@sm80_or_better_or_fallback
 @pytest.mark.parametrize(
     "op",
-    [
-        fmha.triton_splitk.FwOp,
-        fmha.flash.FwOp,
-        fmha.flash3.FwOp,
-        None,
-    ],
+    (
+        [
+            fmha.triton_splitk.FwOp,
+            fmha.flash.FwOp,
+            fmha.flash3.FwOp,
+            None,
+        ]
+        if HAS_MSLK
+        else [None]
+    ),
     ids=lambda op: "None" if op is None else op.NAME,
 )
 @pytest.mark.parametrize("G,H", [(1, 11), (7, 1), (1, 1), (7, 11), (None, 11)])
@@ -88,13 +117,18 @@ def test_merge_attentions_nobias(
     Merging the same attention twice shouldn't change anything.
     This also tests the shape of the lse output of each permitted op.
     """
-    if op is fmha.flash3.FwOp and not op.is_available():
+    if op is not None and op is fmha.flash3.FwOp and not op.is_available():
         pytest.skip("Flash3 not available")
     B, Mq, K = 13, 3, 192
-    if op is fmha.triton_splitk.FwOp:
+    if op is not None and op is fmha.triton_splitk.FwOp:
         K = 128
     case_name = str((write_lse, G, H, stack_inputs)).encode("ascii")
     many_keys = hashlib.md5(case_name).digest()[0] % 2
+    if many_keys and not HAS_MSLK and (G or 1) * H > 1:
+        pytest.skip(
+            "M=100000 with G*H>1: the SDPA fallback materializes the broadcast "
+            "K/V (~3 GB peak per head), too large to run on the CPU"
+        )
     M = [5, 100000][many_keys]
     if op is None or torch.bfloat16 in op.SUPPORTED_DTYPES:
         dtype = torch.bfloat16
@@ -103,15 +137,15 @@ def test_merge_attentions_nobias(
     if dtype == torch.float8_e4m3fn:
         pytest.skip("float8 not supported")
     if G is None:
-        q = 3 * torch.rand(B, Mq, H, K, dtype=dtype, device="cuda")
-        k = (3 * torch.rand(B, M, 1, K, dtype=dtype, device="cuda")).expand(B, M, H, K)
-        v = (3 * torch.rand(B, M, 1, K, dtype=dtype, device="cuda")).expand(B, M, H, K)
+        q = 3 * torch.rand(B, Mq, H, K, dtype=dtype, device=DEVICE)
+        k = (3 * torch.rand(B, M, 1, K, dtype=dtype, device=DEVICE)).expand(B, M, H, K)
+        v = (3 * torch.rand(B, M, 1, K, dtype=dtype, device=DEVICE)).expand(B, M, H, K)
     else:
-        q = 3 * torch.rand(B, Mq, G, H, K, dtype=dtype, device="cuda")
-        k = (3 * torch.rand(B, M, G, 1, K, dtype=dtype, device="cuda")).expand(
+        q = 3 * torch.rand(B, Mq, G, H, K, dtype=dtype, device=DEVICE)
+        k = (3 * torch.rand(B, M, G, 1, K, dtype=dtype, device=DEVICE)).expand(
             B, M, G, H, K
         )
-        v = (3 * torch.rand(B, M, G, 1, K, dtype=dtype, device="cuda")).expand(
+        v = (3 * torch.rand(B, M, G, 1, K, dtype=dtype, device=DEVICE)).expand(
             B, M, G, H, K
         )
     out1, lse1 = fmha.memory_efficient_attention_partial(q, k, v, op=op)
@@ -140,14 +174,19 @@ def test_merge_attentions_nobias(
 
 @disable_on_rocm
 @sm80_or_better_only
+@needs_mslk_ops
 @pytest.mark.parametrize(
     "dtype,op",
-    [
-        (torch.bfloat16, fmha.triton_splitk.FwOp_S1),
-        # Cutlass's LSE is not consistent
-        # (torch.float32, fmha.cutlass.FwOp),
-        (torch.bfloat16, fmha.flash.FwOp),
-    ],
+    (
+        [
+            (torch.bfloat16, fmha.triton_splitk.FwOp_S1),
+            # Cutlass's LSE is not consistent
+            # (torch.float32, fmha.cutlass.FwOp),
+            (torch.bfloat16, fmha.flash.FwOp),
+        ]
+        if HAS_MSLK
+        else [(torch.bfloat16, None)]
+    ),
     ids=lambda o: f"{o.NAME}" if hasattr(o, "NAME") else str(o),
 )
 @pytest.mark.parametrize("num_queries", [1])
@@ -215,15 +254,20 @@ def test_partial_paged(
 
 @disable_on_rocm
 @sm80_or_better_only
+@needs_mslk_ops
 @pytest.mark.parametrize(
     "dtype,op",
-    [
-        (torch.bfloat16, fmha.triton_splitk.FwOp_S1),
-        (torch.bfloat16, fmha.triton_splitk.FwOp_S32),
-        # Cutlass's LSE is not consistent
-        # (torch.float32, fmha.cutlass.FwOp),
-        (torch.bfloat16, fmha.flash.FwOp),
-    ],
+    (
+        [
+            (torch.bfloat16, fmha.triton_splitk.FwOp_S1),
+            (torch.bfloat16, fmha.triton_splitk.FwOp_S32),
+            # Cutlass's LSE is not consistent
+            # (torch.float32, fmha.cutlass.FwOp),
+            (torch.bfloat16, fmha.flash.FwOp),
+        ]
+        if HAS_MSLK
+        else [(torch.bfloat16, None)]
+    ),
     ids=lambda o: f"{o.NAME}" if hasattr(o, "NAME") else str(o),
 )
 @pytest.mark.parametrize("num_queries", [1, 2])
@@ -365,12 +409,17 @@ def test_merge_attentions_decoding(
 
 @disable_on_rocm
 @sm80_or_better_only
+@needs_mslk_ops
 @pytest.mark.parametrize(
     "dtype,op",
-    [
-        (torch.bfloat16, fmha.triton_splitk.FwOp_S1),
-        (torch.bfloat16, fmha.triton_splitk.FwOp_S32),
-    ],
+    (
+        [
+            (torch.bfloat16, fmha.triton_splitk.FwOp_S1),
+            (torch.bfloat16, fmha.triton_splitk.FwOp_S32),
+        ]
+        if HAS_MSLK
+        else [(torch.bfloat16, None)]
+    ),
     ids=lambda o: f"{o.NAME}" if hasattr(o, "NAME") else str(o),
 )
 @pytest.mark.parametrize("gqa", [False, True], ids=lambda x: "gqa" if x else "")
@@ -485,7 +534,7 @@ def test_merge_attentions_sharedinput(
     )
 
 
-@sm80_or_better_only
+@sm80_or_better_or_fallback
 @pytest.mark.parametrize("bmghk", (False, True))
 def test_merge_attentions_against_ref(bmghk: bool):
     split_k = 16
@@ -496,8 +545,8 @@ def test_merge_attentions_against_ref(bmghk: bool):
     D_H = 128
     dtype = torch.float32
 
-    attn_split = torch.randn([split_k, B, M, G, N_H_L, D_H], dtype=dtype, device="cuda")
-    lse_split = torch.randn([split_k, B, G, N_H_L, M], dtype=dtype, device="cuda")
+    attn_split = torch.randn([split_k, B, M, G, N_H_L, D_H], dtype=dtype, device=DEVICE)
+    lse_split = torch.randn([split_k, B, G, N_H_L, M], dtype=dtype, device=DEVICE)
 
     if not bmghk:
         attn_split = attn_split[:, :, :, 0]
@@ -539,6 +588,7 @@ def _merge_attentions_ref(attn_split, lse_split):
 
 
 @sm80_or_better_only
+@needs_flash3
 def test_merge_attention_with_compile() -> None:
     op = fmha.flash3.FwOp
     if not op.is_available():
@@ -571,6 +621,7 @@ def test_merge_attention_with_compile() -> None:
 
 
 @sm80_or_better_only
+@needs_merge_training
 def test_merge_training():
     torch.manual_seed(1)
     B, M, H, K = 1, 50, 1, 128
@@ -635,6 +686,7 @@ def _slice(partial: Partial, a: int, b: int) -> Partial:
 
 
 @sm80_or_better_only
+@needs_merge_training
 def test_merge_training_compile():
     torch.manual_seed(1)
     B, M, H, K = 1, 50, 1, 128
@@ -681,12 +733,14 @@ def test_merge_training_compile():
 
 
 @sm80_or_better_only
+@needs_merge_training
 def test_merge_training_zilch():
     with pytest.raises(ValueError, match="No partials to merge"):
         merge_attentions_autograd()
 
 
 @sm80_or_better_only
+@needs_merge_training
 def test_merge_training_undilate():
     torch.manual_seed(1)
 

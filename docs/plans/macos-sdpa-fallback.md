@@ -230,3 +230,29 @@ diffusers 0.40, DINOv2 from torch.hub with random weights):
   With non-uniform drop path, DINOv2's nested training hits an autograd
   in-place-on-split-view error that is device-independent (DINOv2 + autograd,
   not the fallback).
+
+---
+
+## Step 7 (2026-10-02): upstream's test suite without mslk
+
+Before: 13 of 25 test files failed to import on macOS, mostly because
+`tests/utils.py` imported mslk-only `Inputs`/`InputsFp8` at module level.
+After: all 25 import; the full suite on macOS is 1172 passed, 2306 skipped
+(CUDA/ROCm/sm90+, or "needs mslk operators"), 0 failed. Every guard is a
+no-op when mslk is installed (checked by diff review, and for five files by
+comparing collected test IDs and skip reasons with mslk's modules stubbed).
+
+- Tests parametrized over mslk operator classes collect no cases without mslk;
+  op-free tests run (attn_bias, references, `merge_attentions` with op=None,
+  TreeAttnMetadata, selective checkpointing on CPU).
+- Found and fixed: the fallback silently cast/moved tensor biases with a
+  different dtype/device than the query, while mslk rejects them (upstream's
+  `TestAttnBias.test_f16_biasf32`). Now a ValueError, so code that runs on
+  the fallback also runs with mslk.
+- CI runs the whole suite (fallback_test on macOS/Linux, mps_test on the MPS
+  runner, which keeps its strict no-MPS-skips check on the fallback files).
+
+Follow-up found: GQA/MQA inputs (K/V expanded with stride 0 across G/H) are
+copied by the fallback's reshape to SDPA layout; at M=100k that is ~3 GB per
+head, so 7 large merge_attentions cases are skipped without mslk. SDPA's
+`enable_gqa` could avoid the copy.

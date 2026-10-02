@@ -10,10 +10,7 @@ on:
     paths:
       - "xformers/**"
       - "!xformers/benchmarks/**"
-      - "tests/test_fmha_sdpa_fallback.py"
-      - "tests/test_fmha_backend_detection.py"
-      - "tests/test_tree_attention_fallback.py"
-      - "tests/test_indexing_fallback.py"
+      - "tests/**"
       - ".github/workflows/fallback_test.yml"
       - "setup.py"
       - "pyproject.toml"
@@ -60,7 +57,7 @@ jobs:
         # and an isolated build would download a second (CUDA, on Linux) torch.
         run: pip install --no-build-isolation -e .
       - name: Install test tools
-        run: pip install "pytest==9.0.3" "pytest-timeout==2.3.1"
+        run: pip install "pytest==9.0.3" "pytest-timeout==2.3.1" scipy
       - name: Environment info
         run: |
           python -c "import torch; print('torch', torch.__version__, '| mps available:', torch.backends.mps.is_available())"
@@ -74,10 +71,7 @@ jobs:
           assert hasattr(xops, "memory_efficient_attention")
           print("fmha backend:", fmha.FMHA_BACKEND)
           PY
-      - name: Run fallback tests
-        run: >
-          python -m pytest -v --timeout 600
-          tests/test_fmha_sdpa_fallback.py
-          tests/test_fmha_backend_detection.py
-          tests/test_tree_attention_fallback.py
-          tests/test_indexing_fallback.py
+      - name: Run the test suite
+        # The whole suite, upstream's tests included: the fallback's own tests
+        # plus everything that doesn't need mslk or CUDA (the rest skips).
+        run: python -m pytest -v --timeout 600 tests

@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 from functools import reduce
 from itertools import accumulate
 from typing import List, Optional, Tuple, Type
@@ -11,11 +13,11 @@ import pytest
 import torch
 
 from xformers.ops import fmha
+from xformers.ops.fmha._backend import HAS_MSLK
 from xformers.ops.fmha.attn_bias import (
     BlockDiagonalPaddedKeysMask,
     PagedBlockDiagonalPaddedKeysMask,
 )
-from xformers.ops.fmha.common import AttentionFwOpBase
 from xformers.ops.tree_attention import (
     construct_full_tree_choices,
     construct_tree_choices,
@@ -24,6 +26,12 @@ from xformers.ops.tree_attention import (
     use_triton_splitk_for_prefix,
 )
 from xformers.utils import do_bench_cudagraph
+
+# Without mslk (e.g. on macOS) there are no operator classes; the
+# TreeAttnMetadata tests below still run. Tree attention itself on the SDPA
+# fallback is covered by test_tree_attention_fallback.py.
+if HAS_MSLK:
+    from xformers.ops.fmha.common import AttentionFwOpBase
 
 compute_capability = (0, 0)
 if torch.cuda.is_available():
@@ -70,6 +78,11 @@ medusa_choices = [
 
 
 @sm80_or_better_only
+@pytest.mark.skipif(
+    not HAS_MSLK,
+    reason="uses mslk's triton_splitk operator; "
+    "see test_tree_attention_fallback.py for the SDPA fallback",
+)
 @pytest.mark.parametrize(
     "tree_choices",
     [
@@ -102,8 +115,10 @@ def test_tree_attention(
     )
 
 
-class SplitKAutotune(fmha.triton_splitk.FwOp):
-    AUTOTUNE = True
+if HAS_MSLK:
+
+    class SplitKAutotune(fmha.triton_splitk.FwOp):
+        AUTOTUNE = True
 
 
 def run_tree_attention_inner(

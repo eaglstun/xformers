@@ -31,7 +31,7 @@ jobs:
           echo "$PWD/.ci-venv/bin" >> "$GITHUB_PATH"
       - name: Install PyTorch, xFormers and test tools
         run: |
-          uv pip install --python .ci-venv torch setuptools wheel "pytest==9.0.3" "pytest-timeout==2.3.1"
+          uv pip install --python .ci-venv torch setuptools wheel "pytest==9.0.3" "pytest-timeout==2.3.1" scipy
           uv pip install --python .ci-venv --no-build-isolation -e .
       - name: Check that MPS is actually usable
         # Fail rather than let the MPS tests skip: that would make this job
@@ -59,3 +59,10 @@ jobs:
             echo "::error::MPS tests were skipped on the MPS runner"
             exit 1
           fi
+      - name: Run the rest of the test suite
+        run: >
+          python -m pytest --timeout 600 tests
+          --deselect tests/test_fmha_sdpa_fallback.py
+          --deselect tests/test_fmha_backend_detection.py
+          --deselect tests/test_tree_attention_fallback.py
+          --deselect tests/test_indexing_fallback.py

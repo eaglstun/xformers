@@ -19,6 +19,7 @@ from xformers.checkpoint import (
     list_operators,
     selective_checkpoint_wrapper,
 )
+from xformers.ops.fmha._backend import HAS_MSLK
 
 from .utils import cuda_only
 
@@ -105,20 +106,29 @@ def test_checkpoint_with_grad(policy_fn, input_requires_grad, grad_mode):
 
 
 @cuda_only
+@pytest.mark.skipif(
+    not HAS_MSLK,
+    reason="parametrized over mslk attention operators (flash/cutlass/ck); "
+    "the SDPA fallback has no op= selection",
+)
 @pytest.mark.parametrize("policy_fn", [None, [], _relu_policy, _all_policy])
 @pytest.mark.parametrize("input_requires_grad", [True, False])
 @pytest.mark.parametrize("device", ["cuda"])
 @pytest.mark.parametrize("autocast", [True, False])
 @pytest.mark.parametrize(
     "op",
-    [
-        xformers.ops.MemoryEfficientAttentionFlashAttentionOp,
-        (
-            xformers.ops.MemoryEfficientAttentionCutlassOp
-            if torch.version.cuda
-            else xformers.ops.MemoryEfficientAttentionCkOp
-        ),
-    ],
+    (
+        [
+            xformers.ops.MemoryEfficientAttentionFlashAttentionOp,
+            (
+                xformers.ops.MemoryEfficientAttentionCutlassOp
+                if torch.version.cuda
+                else xformers.ops.MemoryEfficientAttentionCkOp
+            ),
+        ]
+        if HAS_MSLK
+        else [None]
+    ),
 )
 def test_checkpoint_attention(policy_fn, input_requires_grad, device, autocast, op):
     if (

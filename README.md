@@ -125,7 +125,7 @@ out = xops.memory_efficient_attention(q, q, q, attn_bias=fmha.attn_bias.LowerTri
 
 - `memory_efficient_attention`, plus its `_forward`, `_forward_requires_grad` and `_backward` variants. The backward pass comes from autograd.
 - `memory_efficient_attention_partial` and `merge_attentions`.
-- Every `attn_bias` type, including the block-diagonal, padded, paged and local-attention variants, and plain tensors.
+- Every `attn_bias` type, including the block-diagonal, padded, paged and local-attention variants, and plain tensors. As with mslk, a tensor bias must have the query's dtype and device; it's rejected, not converted.
   - `LowerTriangularMask` maps to SDPA's `is_causal`.
   - `BlockDiagonalMask`, `BlockDiagonalCausalMask` and `BlockDiagonalCausalFromBottomRightMask` run one sequence at a time, batching sequences of the same length, so memory scales with the sequence lengths rather than the packed total.
   - The other biases are materialized as a dense `[Mq, Mk]` mask.

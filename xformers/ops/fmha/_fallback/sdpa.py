@@ -148,7 +148,21 @@ def _tensor_bias_to_mask(
             f"attn_bias tensor of shape {tuple(bias.shape)} has more dimensions than "
             f"expected {target}"
         )
-    bias = bias.to(device=query.device, dtype=query.dtype).expand(target)
+    # mslk's kernels reject these instead of converting, so do the same: code
+    # that works on the fallback must also work with mslk.
+    if bias.dtype != query.dtype:
+        raise ValueError(
+            "attn_bias tensor should have the same dtype as the query\n"
+            f"  query.dtype    : {query.dtype}\n"
+            f"  attn_bias.dtype: {bias.dtype}"
+        )
+    if bias.device != query.device:
+        raise ValueError(
+            "Attention bias and Query/Key/Value should be on the same device\n"
+            f"  query.device: {query.device}\n"
+            f"  attn_bias   : {bias.device}"
+        )
+    bias = bias.expand(target)
     return bias.reshape(B, math.prod(gh), Mq, Mk)
 
 

@@ -10,8 +10,17 @@ import torch
 
 import xformers.ops
 from xformers.ops import fmha
+from xformers.ops.fmha._backend import HAS_MSLK, MSLK_UNAVAILABLE_REASON
 
 from .utils import disable_on_rocm, ref_attention_bmhk_for_test
+
+if not HAS_MSLK:
+    # Every test here is about mslk's flash3 operator (its FLOP formula and
+    # mask_non_zeros), which the SDPA fallback does not have.
+    pytest.skip(
+        f"tests mslk's fmha.flash3 operator, but {MSLK_UNAVAILABLE_REASON}",
+        allow_module_level=True,
+    )
 
 compute_capability = (0, 0)
 if torch.cuda.is_available():

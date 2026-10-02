@@ -3,11 +3,23 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 import logging
 import math
 import random
 from contextlib import nullcontext
-from typing import Any, List, Optional, Sequence, Tuple, Type, TypeVar
+from typing import (
+    Any,
+    Callable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    TYPE_CHECKING,
+    TypeVar,
+)
 
 import pytest
 import torch
@@ -24,13 +36,25 @@ import xformers.ops
 from torch.utils.checkpoint import checkpoint
 from xformers.attn_bias_utils import create_attn_bias, pack_kv_cache
 from xformers.ops import fmha
-from xformers.ops.fmha import ALL_BW_OPS, ALL_FW_OPS
-from xformers.ops.fmha.common import (
-    AttentionFwOpBase,
-    AttentionOpBase,
-    pack_fp8_tensorwise_per_head,
-)
-from xformers.ops.fmha.dispatch import _dispatch_fw_priority_list
+from xformers.ops.fmha._backend import HAS_MSLK
+
+# Without mslk (e.g. on macOS), xformers.ops.fmha is the PyTorch SDPA fallback:
+# attn_bias and memory_efficient_attention(op=None) work, but there are no
+# operator classes. Tests parametrized over operators then collect no cases
+# (reported as skipped), tests that need an operator are `requires_mslk`, and
+# a test that only calls memory_efficient_attention(op=None) on CUDA runs on CPU.
+# With mslk, all of this is a no-op.
+if HAS_MSLK or TYPE_CHECKING:
+    from xformers.ops.fmha import ALL_BW_OPS, ALL_FW_OPS
+    from xformers.ops.fmha.common import (
+        AttentionBwOpBase,
+        AttentionFwOpBase,
+        AttentionOpBase,
+        pack_fp8_tensorwise_per_head,
+    )
+    from xformers.ops.fmha.dispatch import _dispatch_fw_priority_list
+else:
+    ALL_FW_OPS = ALL_BW_OPS = []
 
 from .utils import (
     assert_allclose,
@@ -45,6 +69,19 @@ from .utils import (
     rocm_only,
     use_cpu_ref,
 )
+
+requires_mslk = pytest.mark.skipif(not HAS_MSLK, reason="needs mslk operators")
+# For op=None tests: CUDA with mslk (same as cuda_only), CPU in the fallback.
+op_free_device = "cuda" if HAS_MSLK else "cpu"
+cuda_only_with_mslk = pytest.mark.skipif(
+    HAS_MSLK and not torch.cuda.is_available(), reason="requires CUDA"
+)
+
+
+def mslk_ops(make_ops: Callable[[], List[Any]]) -> List[Any]:
+    """`make_ops()`, or no parameters (the test is skipped) without mslk"""
+    return make_ops() if HAS_MSLK else []
+
 
 compute_capability = (0, 0)
 if torch.cuda.is_available():
@@ -88,9 +125,7 @@ except (ImportError, OSError):
     # Failed to load MTIA libraries, so just keep going without MTIA devices
     pass
 
-T = TypeVar(
-    "T", Type[fmha.common.AttentionFwOpBase], Type[fmha.common.AttentionBwOpBase]
-)
+T = TypeVar("T", "Type[AttentionFwOpBase]", "Type[AttentionBwOpBase]")
 
 logger = logging.getLogger("xformers")
 
@@ -696,12 +731,14 @@ def test_logsumexp(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv):
 @cuda_or_mtia_only
 @pytest.mark.parametrize(
     "op",
-    _filter_unsupported_ops(
-        [
-            fmha.cutlass.FwOp,
-            fmha.cutlass_blackwell.FwOp,
-            fmha.flash.FwOp,
-        ]
+    mslk_ops(
+        lambda: _filter_unsupported_ops(
+            [
+                fmha.cutlass.FwOp,
+                fmha.cutlass_blackwell.FwOp,
+                fmha.flash.FwOp,
+            ]
+        )
     ),
 )
 def test_logsumexp_mqa(op):
@@ -1231,6 +1268,7 @@ def test_unsupported_stride_alignment(op: Type[fmha.AttentionFwOpBase]):
         fmha.memory_efficient_attention(q, q, q, op=(op, None))
 
 
+@requires_mslk
 @sm75_or_better_only
 def test_unsupported_dropout_combine_flash_cutlass() -> None:
     q = torch.empty(
@@ -1574,18 +1612,22 @@ def _test_decoder(
 @sm80_or_better_only
 @pytest.mark.parametrize(
     "op,dequant,dtype",
-    [
-        (fmha.triton_splitk.FwOp_S1, False, "bf16"),
-        (fmha.triton_splitk.FwOp_S2, False, "f16"),
-        (fmha.triton_splitk.FwOp_S2, True, "bf16"),
-        (
-            type(
-                "S2_8", (fmha.triton_splitk.FwOp_S2,), {"NUM_GROUPS": 8, "NAME": "S2_8"}
+    mslk_ops(
+        lambda: [
+            (fmha.triton_splitk.FwOp_S1, False, "bf16"),
+            (fmha.triton_splitk.FwOp_S2, False, "f16"),
+            (fmha.triton_splitk.FwOp_S2, True, "bf16"),
+            (
+                type(
+                    "S2_8",
+                    (fmha.triton_splitk.FwOp_S2,),
+                    {"NUM_GROUPS": 8, "NAME": "S2_8"},
+                ),
+                True,
+                "bf16",
             ),
-            True,
-            "bf16",
-        ),
-    ],
+        ]
+    ),
 )
 @pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
 @pytest.mark.parametrize("n_heads", [16])
@@ -1613,7 +1655,10 @@ def test_triton_splitk_decoder(
 
 @rocm_only
 @pytest.mark.parametrize(
-    "op", [fmha.ck_splitk.FwOp_S1, fmha.ck_splitk.FwOp_S2, fmha.ck_splitk.FwOp_S4]
+    "op",
+    mslk_ops(
+        lambda: [fmha.ck_splitk.FwOp_S1, fmha.ck_splitk.FwOp_S2, fmha.ck_splitk.FwOp_S4]
+    ),
 )
 @pytest.mark.parametrize("dtype", ["f32"])
 @pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
@@ -1644,10 +1689,12 @@ def test_ck_splitk_decoder(
 @sm80_or_better_only
 @pytest.mark.parametrize(
     "op",
-    [
-        fmha.triton_splitk.FwOp_S1,
-        fmha.triton_splitk.FwOp_S2,
-    ],
+    mslk_ops(
+        lambda: [
+            fmha.triton_splitk.FwOp_S1,
+            fmha.triton_splitk.FwOp_S2,
+        ]
+    ),
     ids=lambda op: f"splitk{op.SPLIT_K}",
 )
 @pytest.mark.parametrize("multiquery", [True, False], ids=lambda x: "mq" if x else "")
@@ -1684,7 +1731,7 @@ def test_attn_bias_from_seqlens() -> None:
     assert tuple(out[0].shape) == (1, 3, 16)
 
 
-@cuda_only
+@cuda_only_with_mslk
 def test_attn_bias_blockdiag_doc() -> None:
     """IMPORTANT:
     This is the example in the doc for `BlockDiagonalMask`.
@@ -1699,7 +1746,7 @@ def test_attn_bias_blockdiag_doc() -> None:
 
     K = 16
     dtype = torch.float16
-    device = "cuda"
+    device = op_free_device
     list_x = [
         torch.randn([1, 3, 1, K], dtype=dtype, device=device),
         torch.randn([1, 6, 1, K], dtype=dtype, device=device),
@@ -1891,11 +1938,13 @@ def test_forward_gqa(opFW_biasT, Mq: int):
 @cuda_or_mtia_only
 @pytest.mark.parametrize(
     "opBW",
-    [
-        fmha.flash.BwOp,
-        fmha.ck.BwOp if torch.version.hip else fmha.cutlass.BwOp,
-        fmha.cutlass_blackwell.BwOp,
-    ],
+    mslk_ops(
+        lambda: [
+            fmha.flash.BwOp,
+            fmha.ck.BwOp if torch.version.hip else fmha.cutlass.BwOp,
+            fmha.cutlass_blackwell.BwOp,
+        ]
+    ),
 )
 def test_backward_gqa(opBW):
     device = torch._C._get_accelerator().type
@@ -1968,6 +2017,7 @@ def test_forward_gqa_one_group(opFW):
     )
 
 
+@requires_mslk
 @sm80_or_better_only
 @disable_on_rocm
 def test_flash_gqa_wrong_strides() -> None:
@@ -2010,6 +2060,7 @@ def _dispatches_to_flash_decoding(q, kv):
     )
 
 
+@requires_mslk
 @disable_on_rocm
 def test_dispatch_decoding_bmhk() -> None:
     assert not _dispatches_to_splitK(
@@ -2033,6 +2084,7 @@ def test_dispatch_decoding_bmhk() -> None:
     ), "Should not use SplitK if B is big"
 
 
+@requires_mslk
 @disable_on_rocm
 def test_dispatch_decoding_bmghk() -> None:
     assert not _dispatches_to_splitK(
@@ -2076,13 +2128,16 @@ shapes_triton_splitk = [
     (2, 7, 7328, 1, 120, 120),
     (2, 7, 63, 1, 120, 120),
 ]
-op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_splitk = [
-    (fmha.triton_splitk.FwOp, "cuda", torch.float16, type(None), *s)
-    for s in shapes_triton_splitk
-] + [
-    (fmha.triton_splitk.FwOp, "cuda", torch.bfloat16, type(None), *s)
-    for s in shapes_triton_splitk
-]
+op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_splitk = mslk_ops(
+    lambda: [
+        (fmha.triton_splitk.FwOp, "cuda", torch.float16, type(None), *s)
+        for s in shapes_triton_splitk
+    ]
+    + [
+        (fmha.triton_splitk.FwOp, "cuda", torch.bfloat16, type(None), *s)
+        for s in shapes_triton_splitk
+    ]
+)
 
 
 @pytest.mark.parametrize(
@@ -2102,7 +2157,7 @@ def test_forward_splitk(
 @cuda_or_mtia_only
 @pytest.mark.parametrize(
     "op",
-    [fmha.triton_splitk.FwOp, fmha.flash.FwOp, fmha.ck.FwOp],
+    mslk_ops(lambda: [fmha.triton_splitk.FwOp, fmha.flash.FwOp, fmha.ck.FwOp]),
     ids=lambda op: op.NAME,
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=str)
@@ -2228,11 +2283,13 @@ def test_local_attn_bias() -> None:
 @pytest.mark.parametrize("MAX_T", [64, 128, 2048, 4096, 8192])
 @pytest.mark.parametrize(
     "op",
-    [
-        fmha.triton_splitk.FwOp,
-        fmha.triton_splitk.FwOp_S8,
-        fmha.triton_splitk.FwOp_Map[48],
-    ],
+    mslk_ops(
+        lambda: [
+            fmha.triton_splitk.FwOp,
+            fmha.triton_splitk.FwOp_S8,
+            fmha.triton_splitk.FwOp_Map[48],
+        ]
+    ),
     ids=lambda op: op.NAME,
 )
 @pytest.mark.parametrize("num_quant_groups", [0, 1, 8])
@@ -2276,6 +2333,7 @@ def test_paged_attention_ck(B, MAX_T: int, page_size: int, gappy: bool):
         )
 
 
+@requires_mslk
 @sm80_or_better_only
 @disable_on_rocm
 @pytest.mark.parametrize("B", [1, 5, 128])
@@ -2297,7 +2355,10 @@ def test_paged_attention_flash(B, MAX_T: int, page_size: int):
 @sm90_or_better_only
 @disable_on_rocm
 @pytest.mark.parametrize(
-    "op", _filter_unsupported_ops([fmha.flash3.FwOp, fmha.flash3.FwOp_KVSplit])
+    "op",
+    mslk_ops(
+        lambda: _filter_unsupported_ops([fmha.flash3.FwOp, fmha.flash3.FwOp_KVSplit])
+    ),
 )
 @pytest.mark.parametrize("B", [1, 5, 128])
 @pytest.mark.parametrize("MAX_T", [64, 128, 2048, 4096, 8192])
@@ -2570,12 +2631,14 @@ def paged_attention_run_inner(
 @pytest.mark.parametrize("create_bias_inside_compiled", [False, True])
 @pytest.mark.parametrize(
     "op",
-    [
-        None,
-        (fmha.flash.FwOp, fmha.flash.BwOp),
-        (fmha.flash3.FwOp, fmha.flash3.BwOp),
-        (fmha.cutlass_blackwell.FwOp, fmha.cutlass_blackwell.BwOp),
-    ],
+    mslk_ops(
+        lambda: [
+            None,
+            (fmha.flash.FwOp, fmha.flash.BwOp),
+            (fmha.flash3.FwOp, fmha.flash3.BwOp),
+            (fmha.cutlass_blackwell.FwOp, fmha.cutlass_blackwell.BwOp),
+        ]
+    ),
 )
 def test_memeff_compile(bias_t, create_bias_inside_compiled: bool, op) -> None:
     torch.manual_seed(0)
@@ -2860,18 +2923,20 @@ def test_fav3_kvsplit_attn(
 @sm90_or_better_only
 @pytest.mark.parametrize(
     "op",
-    _filter_unsupported_ops(
-        (
-            [
-                fmha.flash.FwOp,
-                fmha.cutlass.FwOp,
-                fmha.flash3.FwOp,
-                fmha.flash3.FwOp_KVSplit,
-            ]
-            if not torch.version.hip
-            else [fmha.ck.FwOp]
+    mslk_ops(
+        lambda: _filter_unsupported_ops(
+            (
+                [
+                    fmha.flash.FwOp,
+                    fmha.cutlass.FwOp,
+                    fmha.flash3.FwOp,
+                    fmha.flash3.FwOp_KVSplit,
+                ]
+                if not torch.version.hip
+                else [fmha.ck.FwOp]
+            )
+            + [fmha.triton_splitk.FwOp]
         )
-        + [fmha.triton_splitk.FwOp]
     ),
 )
 def test_nans_in_padding(op):

@@ -1086,3 +1086,28 @@ def test_paged_bias_matches_page_gather(device: str, n_pages: int) -> None:
         scores = torch.einsum("mhd,nhd->hmn", q[0, b * Mq : (b + 1) * Mq], kk)
         refs.append(torch.einsum("hmn,nhd->mhd", (scores / D**0.5).softmax(-1), vv))
     _assert_close(out[0], torch.cat(refs), "out", 1e-5, 1e-5)
+
+
+@pytest.mark.parametrize(
+    "q_dtype, bias_dtype",
+    [(torch.float16, torch.float32), (torch.float32, torch.float16)],
+)
+def test_tensor_bias_dtype_mismatch_raises(
+    q_dtype: torch.dtype, bias_dtype: torch.dtype
+) -> None:
+    """Like mslk's kernels (see TestAttnBias.test_f16_biasf32 in
+    test_mem_eff_attention.py), reject instead of silently casting, so code
+    that runs on the fallback also runs with mslk."""
+    q = torch.randn(1, 8, 2, 16, dtype=q_dtype)
+    bias = torch.randn(1, 2, 8, 8, dtype=bias_dtype)
+    for bias_arg in (bias, fb.LowerTriangularMaskWithTensorBias(bias)):
+        with pytest.raises(ValueError, match="same dtype"):
+            sdpa.memory_efficient_attention(q, q, q, attn_bias=bias_arg)
+
+
+def test_tensor_bias_device_mismatch_raises() -> None:
+    _skip_if_unsupported("mps", torch.float32)
+    q = torch.randn(1, 8, 2, 16, device="mps")
+    bias = torch.randn(1, 2, 8, 8)
+    with pytest.raises(ValueError, match="same device"):
+        sdpa.memory_efficient_attention(q, q, q, attn_bias=bias)

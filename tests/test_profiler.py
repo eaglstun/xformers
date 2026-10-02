@@ -16,6 +16,7 @@ import xformers.ops.fmha as fmha
 import xformers.profiler
 from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.utils._python_dispatch import _get_current_dispatch_mode
+from xformers.ops.fmha._backend import HAS_MSLK
 from xformers.profiler import profile_analyzer
 
 from .utils import cuda_only
@@ -214,12 +215,21 @@ def test_analyze_prof_sdpa(dtype, backend, causal: bool) -> None:
             x.backward(x)
 
 
+@pytest.mark.skipif(
+    not HAS_MSLK,
+    reason="parametrized over mslk attention operators (cutlass/flash); "
+    "the SDPA fallback has no op= selection",
+)
 @pytest.mark.parametrize(
     "op",
-    [
-        (fmha.cutlass.FwOp, fmha.cutlass.BwOp),
-        (fmha.flash.FwOp, fmha.flash.BwOp),
-    ],
+    (
+        [
+            (fmha.cutlass.FwOp, fmha.cutlass.BwOp),
+            (fmha.flash.FwOp, fmha.flash.BwOp),
+        ]
+        if HAS_MSLK
+        else [None, None]
+    ),
     ids=["cutlass", "flash"],
 )
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", ""])
