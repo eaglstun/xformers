@@ -36,6 +36,11 @@ MPS, ...). Backward comes from autograd. Conventions:
   * Varlen biases (``BlockDiagonal*``) expect the packed layout, so ``B``
     must be 1.
 
+- MQA/GQA: when key and value are both expanded with stride 0 along the
+  head dim (BMHK dim 2, BMGHK dim 3), the compact K/V (one head, or one per
+  group) is passed to SDPA with ``enable_gqa=True`` instead of copying K/V
+  for every query head; the explicit (dropout, LSE) paths group the query
+  heads the same way. Other stride patterns are copied as before.
 - Rows where every key is masked produce an output of 0 (and zero gradients),
   like the xformers kernels; their LSE is ``-inf``. This relies on SDPA's
   safe softmax (PyTorch >= 2.5).
@@ -136,6 +141,40 @@ def _from_sdpa(x: torch.Tensor, query_shape: Tuple[int, ...]) -> torch.Tensor:
     return x.reshape(B, G, H, x.shape[-2], x.shape[-1]).permute(0, 3, 1, 2, 4)
 
 
+def _compact_kv(
+    key: torch.Tensor, value: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Narrow K/V to one head when both are stride-0 expanded along H.
+
+    xformers expresses MQA/GQA by expanding K/V along the head dim (BMHK dim
+    2, BMGHK dim 3). ``narrow`` keeps autograd reaching the expanded tensor
+    (the expand's backward sums the gradient over the heads). In SDPA layout
+    the compact K/V have ``G`` heads (``1`` for BMHK) and query head
+    ``g * H + h`` uses K/V head ``g``, which is SDPA's ``enable_gqa`` grouping.
+    """
+    if key.ndim not in (4, 5):
+        return key, value
+    dim = key.ndim - 2
+    if key.shape[dim] > 1 and key.stride(dim) == 0 and value.stride(dim) == 0:
+        return key.narrow(dim, 0, 1), value.narrow(dim, 0, 1)
+    return key, value
+
+
+def _grouped_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``a @ b`` where ``a`` has ``Hq`` heads and ``b`` has ``Hkv`` heads.
+
+    a: [B, Hq, M, X], b: [B, Hkv, X, N] with Hq a multiple of Hkv; query head
+    i uses b's head ``i // (Hq // Hkv)``. The ``Hq // Hkv`` query heads of a
+    group are folded into M, so b is never copied per query head.
+    """
+    B, Hq, M, X = a.shape
+    Hkv = b.shape[1]
+    if Hkv == Hq:
+        return a @ b
+    out = a.reshape(B, Hkv, (Hq // Hkv) * M, X) @ b
+    return out.view(B, Hq, M, b.shape[-1])
+
+
 def _tensor_bias_to_mask(
     bias: torch.Tensor, query: torch.Tensor, Mk: int
 ) -> torch.Tensor:
@@ -222,7 +261,7 @@ def _attention_with_dropout(
     SDPA on MPS does not support dropout, so dropout always takes this path,
     on every device, for consistent behavior.
     """
-    scores = (q @ k.transpose(-2, -1)) * scale
+    scores = _grouped_matmul(q, k.transpose(-2, -1)) * scale
     if is_causal:
         mask = _vendored_attn_bias.LowerTriangularMask().materialize(
             scores.shape[-2:], dtype=q.dtype, device=q.device
@@ -235,7 +274,7 @@ def _attention_with_dropout(
     attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(v.dtype)
     attn = attn.masked_fill(fully_masked, 0.0)
     attn = torch.nn.functional.dropout(attn, p=p, training=True)
-    return attn @ v
+    return _grouped_matmul(attn, v)
 
 
 def _core(
@@ -248,10 +287,15 @@ def _core(
     scale: float,
     compute_lse: bool,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Attention in SDPA layout: returns (out [B, GH, Mq, Kv], lse [B, GH, Mq])."""
+    """Attention in SDPA layout: returns (out [B, GH, Mq, Kv], lse [B, GH, Mq]).
+
+    k and v may have fewer heads than q (see ``_compact_kv``).
+    """
     if p == 0.0:
+        # Only pass enable_gqa when needed, so other calls stay unchanged.
+        gqa: Dict[str, bool] = {"enable_gqa": True} if k.shape[1] != q.shape[1] else {}
         out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, is_causal=is_causal, scale=scale
+            q, k, v, attn_mask=mask, is_causal=is_causal, scale=scale, **gqa
         )
     else:
         out = _attention_with_dropout(q, k, v, mask, is_causal, p, scale)
@@ -259,7 +303,7 @@ def _core(
     lse = None
     if compute_lse:
         with torch.no_grad():
-            scores = (q.float() @ k.float().transpose(-2, -1)) * scale
+            scores = _grouped_matmul(q.float(), k.float().transpose(-2, -1)) * scale
             if is_causal:
                 mask = _vendored_attn_bias.LowerTriangularMask().materialize(
                     scores.shape[-2:], dtype=torch.float32, device=scores.device
@@ -368,11 +412,13 @@ def _attention(
         and type(attn_bias) in _BLOCK_DIAGONAL_TYPES
         and query.shape[1] > 0
     ):
+        key, value = _compact_kv(key, value)
         out, lse = _attention_block_diagonal(
             query, key, value, attn_bias, p, scale, compute_lse
         )
     else:
         mask, is_causal = _bias_to_mask(attn_bias, query, key.shape[1])
+        key, value = _compact_kv(key, value)
         q, k, v = _to_sdpa(query), _to_sdpa(key), _to_sdpa(value)
         out, lse = _core(q, k, v, mask, is_causal, p, scale, compute_lse)
         out = _from_sdpa(out, query.shape)

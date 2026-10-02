@@ -256,3 +256,33 @@ Follow-up found: GQA/MQA inputs (K/V expanded with stride 0 across G/H) are
 copied by the fallback's reshape to SDPA layout; at M=100k that is ~3 GB per
 head, so 7 large merge_attentions cases are skipped without mslk. SDPA's
 `enable_gqa` could avoid the copy.
+
+---
+
+## Step 8 (2026-10-02): grouped K/V heads without copying (`enable_gqa`)
+
+xformers expresses MQA/GQA by expanding K/V with stride 0: BMHK with
+`key.stride(2) == 0` (one K/V head), or BMGHK with `key.stride(3) == 0`
+(one K/V head per group G). The fallback's reshape to SDPA layout turns
+that into a real copy per query head. SDPA's `enable_gqa=True` takes the
+compact K/V instead; query head `i` uses K/V head `i // (Hq // Hkv)`, which
+is exactly xformers' `g * H + h -> g` grouping.
+
+Measured (torch 2.14.1, fp16, after warm-up), identical outputs with and
+without masks:
+
+| Shape (MPS) | enable_gqa | copy per call |
+|---|---|---|
+| Mq=1, Mk=64k, Hq=32, Hkv=8 | 1.18 ms | 5.73 ms |
+| Mq=16, Mk=64k, Hq=32, Hkv=4 | 15.5 ms | 19.8 ms |
+| Mq=2k, Mk=2k, Hq=32, Hkv=8 | 5.05 ms | 5.17 ms |
+| Mq=4k, Mk=4k, Hq=16, Hkv=1 | 10.0 ms | 10.2 ms |
+
+Peak MPS memory for the first shape: +0 MiB vs +512 MiB per K/V. On CPU,
+enable_gqa was also ~4x faster for long KV.
+
+Design: detect K and V both expanded with stride 0 along the H dim
+(BMHK dim 2, BMGHK dim 3), pass the compact K/V (a `narrow` of the expanded
+tensor, so autograd still reaches the user's tensor) with `enable_gqa=True`.
+The explicit paths (dropout, LSE) broadcast scores per group instead of
+copying K/V. Other stride patterns keep today's behaviour.

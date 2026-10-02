@@ -124,10 +124,11 @@ def test_merge_attentions_nobias(
         K = 128
     case_name = str((write_lse, G, H, stack_inputs)).encode("ascii")
     many_keys = hashlib.md5(case_name).digest()[0] % 2
-    if many_keys and not HAS_MSLK and (G or 1) * H > 1:
+    if many_keys and not HAS_MSLK and (G or 1) > 1:
         pytest.skip(
-            "M=100000 with G*H>1: the SDPA fallback materializes the broadcast "
-            "K/V (~3 GB peak per head), too large to run on the CPU"
+            "M=100000 with G=7 on the SDPA fallback's CPU: the compact K and V "
+            "are 3.5 GB each in bf16, plus a float32 copy of K for the LSE "
+            "(~17 GB peak RSS)"
         )
     M = [5, 100000][many_keys]
     if op is None or torch.bfloat16 in op.SUPPORTED_DTYPES:

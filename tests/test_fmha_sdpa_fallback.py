@@ -1111,3 +1111,201 @@ def test_tensor_bias_device_mismatch_raises() -> None:
     bias = torch.randn(1, 2, 8, 8)
     with pytest.raises(ValueError, match="same device"):
         sdpa.memory_efficient_attention(q, q, q, attn_bias=bias)
+
+
+# ---------------------------------------------------------------------------
+# MQA/GQA: K/V expanded with stride 0 along the head dim run with enable_gqa
+# ---------------------------------------------------------------------------
+
+_GQA_LAYOUTS = ["BMHK_mqa", "BMGHK_gqa"]
+
+
+def _make_gqa_inputs(layout: str, B: int, Mq: int, Mk: int, device, dtype, Kv=24):
+    """Returns (q, k_base, v_base, expand): k_base/v_base have one head (per
+    group), and expand(x) expands them with stride 0 to the query's heads."""
+    K, G, H = 16, 2, 3
+    if layout == "BMHK_mqa":
+        qs, ks, vs = [B, Mq, H, K], [B, Mk, 1, K], [B, Mk, 1, Kv]
+
+        def expand(x):
+            return x.expand(B, x.shape[1], H, x.shape[-1])
+
+    else:
+        qs, ks, vs = [B, Mq, G, H, K], [B, Mk, G, 1, K], [B, Mk, G, 1, Kv]
+
+        def expand(x):
+            return x.expand(B, x.shape[1], G, H, x.shape[-1])
+
+    q, kb, vb = (torch.randn(s).to(dtype).to(device) for s in (qs, ks, vs))
+    return q, kb, vb, expand
+
+
+def _gqa_bias(bias_name: str, q: torch.Tensor, Mk: int, device, dtype):
+    """(attn_bias, reference bias [B|1, Hq, Mq, Mk] fp32 cpu)."""
+    B, Mq, Hq = q.shape[0], q.shape[1], _num_heads(q)
+    if bias_name == "tensor":
+        t = torch.randn([B, *q.shape[2:-1], Mq, Mk]).to(dtype)
+        return t.to(device), t.float().reshape(B, Hq, Mq, Mk)
+    if bias_name == "padded_keys":  # materialized: no per-block path
+        bias = fb.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+            [3, 5, 4], 8, [5, 0, 6], device=torch.device(device)
+        )
+        return bias, bias.materialize((1, Hq, Mq, Mk), dtype=torch.float32)
+    case = _BIAS_BY_NAME[bias_name]
+    return case.make(B, Hq, Mq, Mk, device, dtype)
+
+
+# name -> (B, Mq, Mk)
+_GQA_BIASES = {
+    "none": (2, 5, 7),
+    "causal_mq<mk": (2, 5, 9),
+    "tensor": (2, 6, 9),
+    "blockdiag_causal_qkv": (1, sum(_QS), sum(_KS)),  # per-block path
+    "padded_keys": (1, 12, 24),
+}
+
+
+def _run_gqa(q, kb, vb, expand, bias, grad_out, p=0.0, copy=False):
+    """(out, lse, (dq, dk_base, dv_base)); copy=True passes contiguous K/V,
+    which forces the old path that has K/V for every query head."""
+    q, kb, vb = (x.detach().requires_grad_(True) for x in (q, kb, vb))
+    k, v = expand(kb), expand(vb)
+    if copy:
+        k, v = k.contiguous(), v.contiguous()
+    out = sdpa.memory_efficient_attention(q, k, v, attn_bias=bias, p=p)
+    out.backward(grad_out)
+    _, lse = sdpa.memory_efficient_attention_forward_requires_grad(
+        q, k, v, attn_bias=bias
+    )
+    return out.detach(), lse, (q.grad, kb.grad, vb.grad)
+
+
+@pytest.mark.parametrize("p", [0.0, 0.3], ids=["sdpa", "dropout_branch"])
+@pytest.mark.parametrize("bias_name", list(_GQA_BIASES))
+@pytest.mark.parametrize("layout", _GQA_LAYOUTS)
+@pytest.mark.parametrize("dtype", _DTYPES, ids=lambda d: str(d).split(".")[-1])
+@pytest.mark.parametrize("device", _DEVICES)
+def test_gqa_expanded_kv(device, dtype, layout, bias_name, p, monkeypatch):
+    """Stride-0 expanded K/V (MQA, GQA) match the reference and the copy path:
+    forward, LSE, and grads wrt the compact tensors that were expanded. p > 0
+    runs the explicit branch, with dropout replaced by the identity."""
+    _skip_if_unsupported(device, dtype)
+    torch.manual_seed(30)
+    if p:
+        monkeypatch.setattr(
+            torch.nn.functional, "dropout", lambda x, p=0.5, training=True: x
+        )
+    B, Mq, Mk = _GQA_BIASES[bias_name]
+    q, kb, vb, expand = _make_gqa_inputs(layout, B, Mq, Mk, device, dtype)
+    bias, ref_bias = _gqa_bias(bias_name, q, Mk, device, dtype)
+    grad_out = torch.randn([*q.shape[:-1], 24]).to(dtype).to(device)
+
+    gqa = _run_gqa(q, kb, vb, expand, bias, grad_out, p)
+    copy = _run_gqa(q, kb, vb, expand, bias, grad_out, p, copy=True)
+    assert gqa[1].shape == q.shape[:1] + q.shape[2:-1] + q.shape[1:2]
+    out_ref, lse_ref, (dq, dk, dv) = _ref_attention_safe(
+        q, expand(kb), expand(vb), 0.0 if ref_bias is None else ref_bias, grad_out
+    )
+    head_dim = q.ndim - 2  # the expand's backward sums over the heads
+    grads_ref = (dq, dk.sum(head_dim, keepdim=True), dv.sum(head_dim, keepdim=True))
+    ref = (out_ref, lse_ref.reshape(gqa[1].shape), grads_ref)
+    _check_bd_against(gqa, ref, dtype, "reference")
+    _check_bd_against(gqa, copy, dtype, "copy path")
+
+
+def _spy_sdpa(monkeypatch) -> List[Tuple[bool, int, int, torch.Tensor]]:
+    """Records (enable_gqa, K heads, K numel, K) of each SDPA call."""
+    calls: List[Tuple[bool, int, int, torch.Tensor]] = []
+    real = torch.nn.functional.scaled_dot_product_attention
+
+    def spy(q, k, v, *args, **kwargs):
+        calls.append((kwargs.get("enable_gqa", False), k.shape[1], k.numel(), k))
+        return real(q, k, v, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", spy)
+    return calls
+
+
+@pytest.mark.parametrize("bias_name", ["none", "blockdiag_causal_qkv"])
+@pytest.mark.parametrize("layout", _GQA_LAYOUTS)
+def test_gqa_uses_enable_gqa_without_copy(layout, bias_name, monkeypatch):
+    B, Mq, Mk = _GQA_BIASES[bias_name]
+    q, kb, vb, expand = _make_gqa_inputs(layout, B, Mq, Mk, "cpu", torch.float32)
+    bias, _ = _gqa_bias(bias_name, q, Mk, "cpu", torch.float32)
+    calls = _spy_sdpa(monkeypatch)
+    sdpa.memory_efficient_attention(q, expand(kb), expand(vb), attn_bias=bias)
+    assert calls
+    n_kv_heads = kb.shape[2] if layout == "BMGHK_gqa" else 1
+    total = 0
+    for enable_gqa, heads, numel, k in calls:
+        assert enable_gqa and heads == n_kv_heads
+        total += numel
+        if bias_name == "none":  # a view of the user's tensor: no copy at all
+            assert k.untyped_storage().data_ptr() == kb.untyped_storage().data_ptr()
+    # Memory regression check: SDPA only ever sees the compact K
+    assert total == kb.numel()
+
+
+@pytest.mark.parametrize(
+    "kind", ["only_k_expanded", "expanded_along_G", "contiguous", "BMHK_heads1"]
+)
+def test_gqa_other_strides_keep_copy_path(kind, monkeypatch):
+    if kind == "BMHK_heads1":  # one query head: nothing to group
+        q, k, v = _make_inputs("BMHK", 2, 5, 7, "cpu", torch.float32, H=1)
+    elif kind == "expanded_along_G":
+        q, k, v = _make_inputs("BMGHK", 2, 5, 7, "cpu", torch.float32, expand_kv=True)
+    else:
+        q, kb, vb, expand = _make_gqa_inputs("BMGHK_gqa", 2, 5, 7, "cpu", torch.float32)
+        k, v = expand(kb), expand(vb)
+        if kind == "contiguous":
+            k, v = k.contiguous(), v.contiguous()
+        else:
+            v = v.contiguous()
+    calls = _spy_sdpa(monkeypatch)
+    out = sdpa.memory_efficient_attention(q, k, v)
+    assert [c[:2] for c in calls] == [(False, _num_heads(q))]
+    _assert_close(out, _ref_attention(q, k, v, None), "out", 3e-4, 2e-5)
+
+
+@pytest.mark.parametrize("stacked", [False, True], ids=["list", "stacked"])
+@pytest.mark.parametrize("layout", _GQA_LAYOUTS)
+@pytest.mark.parametrize("dtype", _DTYPES, ids=lambda d: str(d).split(".")[-1])
+@pytest.mark.parametrize("device", _DEVICES)
+def test_gqa_split_kv_merge(device, dtype, layout, stacked):
+    """Partial attention over chunks of expanded K/V, then merge_attentions:
+    matches the reference and the copy path."""
+    _skip_if_unsupported(device, dtype)
+    torch.manual_seed(31)
+    M = 12
+    q, kb, vb, expand = _make_gqa_inputs(layout, 2, M, M, device, dtype)
+    ref_bias = _causal_mask_ref(M, M)
+
+    def split_merge(k, v):
+        outs, lses = [], []
+        for i, (a, b) in enumerate(_split_bounds(M, 3)):
+            bias: object = fb.LowerTriangularMask()
+            if i > 0:
+                bias = ref_bias[:, a:b].to(dtype).to(device)
+            out, lse = sdpa.memory_efficient_attention_partial(
+                q, k[:, a:b], v[:, a:b], attn_bias=bias
+            )
+            outs.append(out)
+            lses.append(lse)
+        if stacked:
+            return sdpa.merge_attentions(torch.stack(outs), torch.stack(lses))
+        return sdpa.merge_attentions(outs, lses)
+
+    k, v = expand(kb), expand(vb)
+    merged, lse = split_merge(k, v)
+    merged_copy, lse_copy = split_merge(k.contiguous(), v.contiguous())
+    assert lse is not None and lse_copy is not None
+    _assert_close(
+        merged,
+        _ref_attention(q, k, v, ref_bias),
+        "merged",
+        _FW_ATOL[dtype],
+        _FW_RTOL[dtype],
+    )
+    _check_lse(lse, _ref_scores(q, k, ref_bias, None).logsumexp(-1), dtype)
+    _assert_close(merged, merged_copy, "vs copy", _FW_ATOL[dtype], _FW_RTOL[dtype])
+    _check_lse(lse, lse_copy, dtype, "lse vs copy")

@@ -130,6 +130,7 @@ out = xops.memory_efficient_attention(q, q, q, attn_bias=fmha.attn_bias.LowerTri
   - `BlockDiagonalMask`, `BlockDiagonalCausalMask` and `BlockDiagonalCausalFromBottomRightMask` run one sequence at a time, batching sequences of the same length, so memory scales with the sequence lengths rather than the packed total.
   - The other biases are materialized as a dense `[Mq, Mk]` mask.
 - The BMK, BMHK and BMGHK layouts, custom `scale`, dropout (`p`), and value head dimensions that differ from the key's.
+- MQA/GQA written the xformers way (K/V expanded with stride 0 along the head dim) runs on SDPA's `enable_gqa`, so K/V are never copied for each query head.
 - `xformers.ops.tree_attention` and `xformers.attn_bias_utils`.
 - `xformers.ops.scaled_index_add` and `xformers.ops.index_select_cat`, which fall back to plain PyTorch when Triton isn't available.
 
