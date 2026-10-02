@@ -70,7 +70,7 @@ runs:
 
     - name: Install python
       if: runner.os == 'Windows'
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ inputs.python }}
 

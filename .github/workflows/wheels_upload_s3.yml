@@ -42,7 +42,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           path: "."
           fetch-depth: 0 # for tags
