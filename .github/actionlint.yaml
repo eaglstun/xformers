@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # Custom label of the on-demand Apple Silicon runner, see mps_test.yml.
+  labels:
+    - mps

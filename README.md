@@ -141,7 +141,7 @@ out = xops.memory_efficient_attention(q, q, q, attn_bias=fmha.attn_bias.LowerTri
 
 **Speed:** the fallback is as fast as PyTorch's SDPA on your device. It isn't a fused memory-efficient kernel, and biases that get materialized cost O(Mq·Mk) memory.
 
-Set `XFORMERS_FMHA_BACKEND=sdpa` to force the fallback even when mslk is installed, for example to test it on Linux. The fallback's tests are in `tests/test_fmha_sdpa_fallback.py`, `tests/test_fmha_backend_detection.py` and `tests/test_tree_attention_fallback.py`. CI runs them on macOS and Linux (`.github/workflows/fallback_test.yml`).
+Set `XFORMERS_FMHA_BACKEND=sdpa` to force the fallback even when mslk is installed, for example to test it on Linux. The fallback's tests are in `tests/test_fmha_sdpa_fallback.py`, `tests/test_fmha_backend_detection.py` and `tests/test_tree_attention_fallback.py`. CI runs them on macOS and Linux (`.github/workflows/fallback_test.yml`), on the CPU only, since GitHub's macOS runners have no usable MPS. `.github/workflows/mps_test.yml` runs them on a real Apple GPU, through a self-hosted runner that's started by hand.
 
 ### Install troubleshooting
 

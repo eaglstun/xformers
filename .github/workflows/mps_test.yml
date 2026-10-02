@@ -1,0 +1,60 @@
+name: mps_test
+
+# Runs the SDPA fallback tests on a real Apple GPU (MPS). GitHub's macOS
+# runners are VMs where MPS isn't usable, so fallback_test.yml only covers CPU.
+#
+# This needs the self-hosted runner labelled `mps`, which only listens while
+# it's started by hand. To run:
+#   ~/actions-runner/run.sh                                   # in one terminal
+#   gh workflow run mps_test.yml -R eaglstun/xformers --ref macos-support
+#
+# Manual trigger only: the fork is public, and a self-hosted runner must never
+# pick up pull_request jobs.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  mps_test:
+    name: mps_test
+    if: github.repository == 'eaglstun/xformers'
+    runs-on: [self-hosted, macOS, ARM64, mps]
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create a clean environment
+        # uv, not actions/setup-python: the venv stays inside the runner's
+        # work directory instead of installing a Python into the tool cache.
+        run: |
+          uv venv --clear --python 3.12 .ci-venv
+          echo "$PWD/.ci-venv/bin" >> "$GITHUB_PATH"
+      - name: Install PyTorch, xFormers and test tools
+        run: |
+          uv pip install --python .ci-venv torch setuptools wheel "pytest==9.0.3" "pytest-timeout==2.3.1"
+          uv pip install --python .ci-venv --no-build-isolation -e .
+      - name: Check that MPS is actually usable
+        # Fail rather than let the MPS tests skip: that would make this job
+        # silently test the CPU only.
+        run: |
+          python - <<'PY'
+          import torch
+          print("torch", torch.__version__)
+          assert torch.backends.mps.is_available(), "MPS is not available"
+          x = torch.ones(1024, device="mps")
+          assert (x + 1).sum().item() == 2048, "MPS computation is wrong"
+          print("MPS is usable")
+          PY
+          python -m xformers.info
+      - name: Run fallback tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -rs --timeout 600 \
+            tests/test_fmha_sdpa_fallback.py \
+            tests/test_fmha_backend_detection.py \
+            tests/test_tree_attention_fallback.py | tee pytest.log
+          if grep -iE "^SKIPPED .*mps" pytest.log; then
+            echo "::error::MPS tests were skipped on the MPS runner"
+            exit 1
+          fi

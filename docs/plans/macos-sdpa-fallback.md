@@ -184,3 +184,25 @@ tree attention.
   excluded in `pyproject.toml` (`[tool.ufmt]`, `[[tool.mypy.overrides]]`) and
   `.flake8`. `_fallback/tree_attention.py` is mostly rewritten, so it gets the
   standard xformers header instead.
+
+---
+
+## Step 5 (2026-10-02): Node 24 actions, MPS runner, troubleshooting
+
+- Actions bumped to Node 24 versions: checkout v7, setup-python v7, cache v6,
+  peaceiris/actions-gh-pages v4.
+- First CI run: GitHub's `macos-14` VMs report `mps.is_available() == True`
+  but every MPS allocation fails ("MPS backend out of memory", 0 bytes
+  allocated). Tests now probe with a real allocation and skip; hosted CI is
+  CPU-only.
+- MPS coverage comes from `mps_test.yml` on a self-hosted runner
+  (`~/actions-runner`, labels `self-hosted, macOS, ARM64, mps`), run on
+  demand as the owner's user. Safety: `workflow_dispatch` only (never
+  `pull_request`), fork-PR approval set to `all_external_contributors`, and
+  the fork's default branch is `macos-support` (manual triggers require the
+  workflow on the default branch). The job fails if MPS isn't usable or any
+  MPS test skips.
+- Correction to step 1: mslk *does* ship Windows wheels (CUDA 13.0,
+  `win_amd64`), so the requirement marker is now `sys_platform != "darwin"`.
+- README: the compile-era troubleshooting (NVCC, TORCH_CUDA_ARCH_LIST, ninja)
+  is replaced by mslk-centric troubleshooting.
