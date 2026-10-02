@@ -25,9 +25,26 @@ from xformers.ops.fmha._fallback import (
     tree_attention as fb_tree,
 )
 
-DEVICES = ["cpu"]
-if torch.backends.mps.is_available():
-    DEVICES.append("mps")
+
+def _mps_usable() -> bool:
+    """is_available() is not enough: on GitHub's macOS runners (VMs) it is True,
+    but every MPS allocation fails with "MPS backend out of memory"."""
+    if not torch.backends.mps.is_available():
+        return False
+    try:
+        torch.ones(1, device="mps").add_(1).cpu()
+    except RuntimeError:
+        return False
+    return True
+
+
+DEVICES = [
+    "cpu",
+    pytest.param(
+        "mps",
+        marks=pytest.mark.skipif(not _mps_usable(), reason="MPS is not usable"),
+    ),
+]
 
 DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 TOLERANCES: Dict[torch.dtype, Dict[str, Any]] = {
