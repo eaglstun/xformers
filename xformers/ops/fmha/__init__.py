@@ -7,12 +7,9 @@
 # submodules re-export mslk symbols to preserve the xformers.ops.fmha API.
 # Without mslk (e.g. on macOS), a reduced API backed by PyTorch's
 # scaled_dot_product_attention is provided instead, see _fallback/sdpa.py.
-import importlib.util
-
 import torch
 
-_HAS_MSLK = importlib.util.find_spec("mslk") is not None
-FMHA_BACKEND = "mslk" if _HAS_MSLK else "sdpa-fallback"
+from ._backend import FMHA_BACKEND, HAS_MSLK as _HAS_MSLK
 
 if _HAS_MSLK:
     # flake8: noqa

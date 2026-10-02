@@ -23,9 +23,18 @@ MPS, ...). Backward comes from autograd. Conventions:
     ``[B, *GH, Mq, Mk]`` (``[B, Mq, Mk]`` for BMK, ``[B, H, Mq, Mk]`` for BMHK).
   * ``LowerTriangularMaskWithTensorBias``: its tensor as above plus a causal
     mask.
+  * exactly ``BlockDiagonalMask``, ``BlockDiagonalCausalMask`` or
+    ``BlockDiagonalCausalFromBottomRightMask``: no mask is built. q is split
+    along M by ``q_seqinfo`` and k/v by ``k_seqinfo``, and each block runs
+    its own attention: unmasked, ``is_causal=True`` (top-left, like
+    ``LowerTriangularMask``), or bottom-right causal (``is_causal`` when
+    ``Mq_i == Mk_i``, else a small ``[Mq_i, Mk_i]`` mask). Blocks with the
+    same ``(Mq_i, Mk_i)`` are stacked on the batch dim into one call (a view
+    when they are consecutive). Memory is O(sum_i Mq_i * Mk_i).
   * any other ``AttentionBias``: ``bias.materialize(...)`` as an additive
-    mask. This costs O(Mq * Mk) memory. Varlen biases (``BlockDiagonal*``)
-    expect the packed layout, so ``B`` must be 1.
+    mask. This costs O(Mq * Mk) memory.
+  * Varlen biases (``BlockDiagonal*``) expect the packed layout, so ``B``
+    must be 1.
 
 - Rows where every key is masked produce an output of 0 (and zero gradients),
   like the xformers kernels; their LSE is ``-inf``. This relies on SDPA's
@@ -42,7 +51,7 @@ MPS, ...). Backward comes from autograd. Conventions:
 """
 
 import math
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple, Union
 
 import torch
 
@@ -59,6 +68,26 @@ _CAUSAL_WITH_TENSOR_TYPES = (
     _vendored_attn_bias.LowerTriangularMaskWithTensorBias,
 )
 _BIAS_TYPES = (_public_attn_bias.AttentionBias, _vendored_attn_bias.AttentionBias)
+
+
+def _both(name: str) -> FrozenSet[type]:
+    return frozenset(
+        {getattr(_public_attn_bias, name), getattr(_vendored_attn_bias, name)}
+    )
+
+
+# Exact types (not subclasses) that run block by block instead of materializing
+# the whole [Mq, Mk] mask.
+_BLOCK_DIAGONAL_CAUSAL_TYPES = _both("BlockDiagonalCausalMask")
+_BLOCK_DIAGONAL_BOTTOM_RIGHT_TYPES = _both("BlockDiagonalCausalFromBottomRightMask")
+_BLOCK_DIAGONAL_TYPES = (
+    _both("BlockDiagonalMask")
+    | _BLOCK_DIAGONAL_CAUSAL_TYPES
+    | _BLOCK_DIAGONAL_BOTTOM_RIGHT_TYPES
+)
+# Private switch for tests and benchmarks: False forces the dense
+# (materialized-mask) path for the block-diagonal biases too.
+_USE_BLOCK_DIAGONAL_PATH = True
 
 _NO_OP_MSG = (
     "xformers.ops.fmha: the `op` argument is not supported because mslk is not "
@@ -94,7 +123,7 @@ def _to_sdpa(x: torch.Tensor) -> torch.Tensor:
     return x.permute(0, 2, 3, 1, 4).reshape(B, G * H, M, K)
 
 
-def _from_sdpa(x: torch.Tensor, query_shape: torch.Size) -> torch.Tensor:
+def _from_sdpa(x: torch.Tensor, query_shape: Tuple[int, ...]) -> torch.Tensor:
     """[B, GH, M, K] -> [B, M, *GH, K]"""
     if len(query_shape) == 3:
         return x.squeeze(1)
@@ -181,6 +210,118 @@ def _attention_with_dropout(
     return attn @ v
 
 
+def _core(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    is_causal: bool,
+    p: float,
+    scale: float,
+    compute_lse: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Attention in SDPA layout: returns (out [B, GH, Mq, Kv], lse [B, GH, Mq])."""
+    if p == 0.0:
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, is_causal=is_causal, scale=scale
+        )
+    else:
+        out = _attention_with_dropout(q, k, v, mask, is_causal, p, scale)
+
+    lse = None
+    if compute_lse:
+        with torch.no_grad():
+            scores = (q.float() @ k.float().transpose(-2, -1)) * scale
+            if is_causal:
+                mask = _vendored_attn_bias.LowerTriangularMask().materialize(
+                    scores.shape[-2:], dtype=torch.float32, device=scores.device
+                )
+            if mask is not None:
+                scores = scores + mask.float()
+            lse = torch.logsumexp(scores, dim=-1)
+    return out, lse
+
+
+def _attention_block_diagonal(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: Any,
+    p: float,
+    scale: float,
+    compute_lse: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Per-block attention for the exact ``_BLOCK_DIAGONAL_TYPES``.
+
+    Blocks sharing ``(Mq_i, Mk_i)`` run as one SDPA call, stacked on the batch
+    dim. Returns (out in the query layout, lse [GH, Mq]).
+    """
+    if query.shape[0] != 1:
+        raise ValueError(
+            f"{type(attn_bias).__name__} expects the packed layout with batch "
+            f"size 1 (sequences concatenated along M), got batch size "
+            f"{query.shape[0]}"
+        )
+    q_starts = attn_bias.q_seqinfo.seqstart_py
+    k_starts = attn_bias.k_seqinfo.seqstart_py
+    if q_starts[-1] != query.shape[1] or k_starts[-1] != key.shape[1]:
+        raise ValueError(
+            f"{type(attn_bias).__name__} covers {q_starts[-1]} queries and "
+            f"{k_starts[-1]} keys, but got Mq={query.shape[1]}, Mk={key.shape[1]}"
+        )
+    bottom_right = type(attn_bias) in _BLOCK_DIAGONAL_BOTTOM_RIGHT_TYPES
+    causal = bottom_right or type(attn_bias) in _BLOCK_DIAGONAL_CAUSAL_TYPES
+
+    # (Mq_i, Mk_i) -> block indices, in order of first appearance
+    groups: Dict[Tuple[int, int], List[int]] = {}
+    for i, (q_start, k_start) in enumerate(zip(q_starts, k_starts[:-1])):
+        if q_starts[i + 1] > q_start:  # blocks without queries contribute nothing
+            shape = (q_starts[i + 1] - q_start, k_starts[i + 1] - k_start)
+            groups.setdefault(shape, []).append(i)
+
+    def consecutive(idx: List[int]) -> bool:
+        return idx[-1] - idx[0] == len(idx) - 1
+
+    def gather(x: torch.Tensor, starts: List[int], idx: List[int], m: int):
+        """Blocks ``idx`` (all of length m) of x[0] -> [n, m, *GH, K]"""
+        if consecutive(idx):  # a view, no copy
+            begin = starts[idx[0]]
+            return x[0, begin : begin + m * len(idx)].unflatten(0, (len(idx), m))
+        return torch.stack([x[0, starts[i] : starts[i] + m] for i in idx])
+
+    # first block index -> (out [M_chunk, *GH, Kv], lse [GH, M_chunk])
+    chunks: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
+    for (mq, mk), idx in groups.items():
+        q = _to_sdpa(gather(query, q_starts, idx, mq))
+        k = _to_sdpa(gather(key, k_starts, idx, mk))
+        v = _to_sdpa(gather(value, k_starts, idx, mk))
+        mask: Optional[torch.Tensor] = None
+        is_causal = False
+        if causal and mk > 0:
+            if bottom_right and mq != mk:
+                mask = _vendored_attn_bias.LowerTriangularFromBottomRightMask().materialize(
+                    (mq, mk), dtype=q.dtype, device=q.device
+                )
+            else:
+                is_causal = True
+        out, lse = _core(q, k, v, mask, is_causal, p, scale, compute_lse)
+        out = _from_sdpa(out, (len(idx), mq, *query.shape[2:]))  # [n, mq, *GH, Kv]
+        if consecutive(idx):
+            lse = None if lse is None else lse.transpose(0, 1).flatten(1)
+            chunks[idx[0]] = (out.flatten(0, 1), lse)
+        else:
+            lse_blocks = [None] * len(idx) if lse is None else lse.unbind(0)
+            for i, o, block_lse in zip(idx, out.unbind(0), lse_blocks):
+                chunks[i] = (o, block_lse)
+
+    ordered = [chunks[i] for i in sorted(chunks)]
+    out = torch.cat([o for o, _ in ordered]).unsqueeze(0)
+    lse = None
+    if compute_lse:
+        lse = torch.cat([x for _, x in ordered], dim=-1)  # type: ignore[misc]
+    return out, lse
+
+
 def _attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -194,30 +335,24 @@ def _attention(
     _check_inputs(query, key, value)
     if scale is None:
         scale = query.shape[-1] ** -0.5
-    mask, is_causal = _bias_to_mask(attn_bias, query, key.shape[1])
-    q, k, v = _to_sdpa(query), _to_sdpa(key), _to_sdpa(value)
-    if p == 0.0:
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, is_causal=is_causal, scale=scale
+    if (
+        _USE_BLOCK_DIAGONAL_PATH
+        and type(attn_bias) in _BLOCK_DIAGONAL_TYPES
+        and query.shape[1] > 0
+    ):
+        out, lse = _attention_block_diagonal(
+            query, key, value, attn_bias, p, scale, compute_lse
         )
     else:
-        out = _attention_with_dropout(q, k, v, mask, is_causal, p, scale)
-    out = _from_sdpa(out, query.shape).contiguous()
+        mask, is_causal = _bias_to_mask(attn_bias, query, key.shape[1])
+        q, k, v = _to_sdpa(query), _to_sdpa(key), _to_sdpa(value)
+        out, lse = _core(q, k, v, mask, is_causal, p, scale, compute_lse)
+        out = _from_sdpa(out, query.shape)
+    out = out.contiguous()
     if output_dtype is not None:
         out = out.to(output_dtype)
-
-    lse = None
-    if compute_lse:
-        with torch.no_grad():
-            scores = (q.float() @ k.float().transpose(-2, -1)) * scale
-            if is_causal:
-                mask = _vendored_attn_bias.LowerTriangularMask().materialize(
-                    scores.shape[-2:], dtype=torch.float32, device=scores.device
-                )
-            if mask is not None:
-                scores = scores + mask.float()
-            lse = torch.logsumexp(scores, dim=-1)  # [B, GH, Mq]
-            lse = lse.reshape(query.shape[:1] + query.shape[2:-1] + query.shape[1:2])
+    if lse is not None:
+        lse = lse.reshape(query.shape[:1] + query.shape[2:-1] + query.shape[1:2])
     return out, lse
 
 

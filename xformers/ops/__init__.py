@@ -4,13 +4,14 @@
 # LICENSE file in the root directory of this source tree.
 
 
-import importlib.util
 import logging
 
 import torch
 import torch.distributed
 
-if _HAS_MSLK := importlib.util.find_spec("mslk") is not None:
+from .fmha._backend import HAS_MSLK as _HAS_MSLK, MSLK_UNAVAILABLE_REASON
+
+if _HAS_MSLK:
     from .fmha import (
         AttentionBias,
         AttentionBias as AttentionMask,
@@ -39,7 +40,7 @@ else:
     )
 
     logging.getLogger("xformers").warning(
-        "WARNING[XFORMERS]: the 'mslk' package is not installed, so "
+        f"WARNING[XFORMERS]: {MSLK_UNAVAILABLE_REASON}, so "
         "xformers.ops.memory_efficient_attention uses a PyTorch SDPA fallback "
         "(no op= selection, fewer features)."
     )

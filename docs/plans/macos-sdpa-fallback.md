@@ -93,3 +93,43 @@ serialization helpers.
 ## Out of scope
 
 Metal kernels, per-block loop optimization, upstreaming, tree attention.
+
+---
+
+## Step 2 (2026-10-02): per-block BlockDiagonal path + backend detection
+
+v1 landed in c1747238. Two follow-ups.
+
+### 2a. Per-block path for block-diagonal biases
+
+Benchmark (MPS, fp16, H=16, K=64, causal, equal-length packed sequences),
+v1 dense materialize vs. splitting into per-sequence SDPA calls:
+
+| seqs × len | M | dense | split |
+|---|---|---|---|
+| 8 × 256 | 2048 | 7.7 ms | 1.1 ms |
+| 16 × 512 | 8192 | 49.9 ms | 2.3 ms |
+| 32 × 512 | 16384 | 108.0 ms | 4.4 ms |
+| 16 × 1024 | 16384 | 109.6 ms | 5.6 ms |
+
+The dense mask is also `[1, H, M, M]`: ~8 GiB at M=16k, H=16, fp16.
+
+Design: in `sdpa.py`, for `BlockDiagonalMask`, `BlockDiagonalCausalMask` and
+`BlockDiagonalCausalFromBottomRightMask` (exact types, mslk or vendored), split
+q by `q_seqinfo` and k/v by `k_seqinfo` and run SDPA per block (`is_causal`
+for top-left causal; bottom-right causal with `Mq_i == Mk_i` is the same as
+`is_causal`, otherwise a small per-block materialized mask). Blocks with the
+same `(Mq_i, Mk_i)` may be batched into one SDPA call. Works for the forward,
+LSE and dropout paths. Every other bias keeps the dense path. Tests: results
+must match the dense path and the reference, including uneven q/kv seqlens and
+zero-length blocks if the bias classes allow them.
+
+### 2b. Robust mslk detection
+
+`importlib.util.find_spec("mslk")` is true for any directory named `mslk` on
+`sys.path` (namespace package) — found by running a script next to an
+unpacked mslk wheel, which made `import xformers.ops` crash. Replace it with
+one shared check that actually imports `mslk.attention.fmha` and treats any
+exception as "no mslk" (the fallback warning includes the reason). Used by
+`xformers/ops/__init__.py`, `xformers/ops/fmha/__init__.py`,
+`xformers/ops/fmha/attn_bias.py` and `xformers/info.py`.

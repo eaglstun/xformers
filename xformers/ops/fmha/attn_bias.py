@@ -18,11 +18,11 @@ parts of the attention matrix we will need to compute (eg causal masks).
 Some very common biases are LowerTriangularMask and BlockDiagonalMask.
 """
 
-import importlib.util
+from ._backend import HAS_MSLK as _HAS_MSLK
 
 # Use mslk's classes when mslk is installed, so that they are the very classes
 # mslk's kernels check against. Otherwise use the copy vendored from mslk 1.3.0.
-if importlib.util.find_spec("mslk") is not None:
+if _HAS_MSLK:
     from mslk.attention.fmha.attn_bias import (  # noqa: F401
         _GappySeqInfo,
         _PaddedSeqLenInfo,

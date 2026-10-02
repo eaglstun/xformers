@@ -4,13 +4,13 @@
 # LICENSE file in the root directory of this source tree.
 
 
-import importlib.util
 from typing import Dict
 
 import torch
 
 from . import __version__, _cpp_lib, _is_opensource, _is_triton_available
 from .ops.common import OPERATORS_REGISTRY
+from .ops.fmha._backend import FMHA_BACKEND, MSLK_UNAVAILABLE_REASON
 from .profiler.profiler_dcgm import DCGM_PROFILER_AVAILABLE
 
 
@@ -20,10 +20,9 @@ def get_features_status() -> Dict[str, str]:
         status_str = "available" if op.is_available() else "unavailable"
         features[f"{op.OPERATOR_CATEGORY}.{op.NAME}"] = status_str
     features["is_triton_available"] = str(_is_triton_available())
-    # Same check as xformers.ops.fmha uses to pick its backend.
-    features["fmha.backend"] = (
-        "mslk" if importlib.util.find_spec("mslk") is not None else "sdpa-fallback"
-    )
+    features["fmha.backend"] = FMHA_BACKEND
+    if MSLK_UNAVAILABLE_REASON is not None:
+        features["fmha.fallback_reason"] = MSLK_UNAVAILABLE_REASON
     return features
 
 

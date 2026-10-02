@@ -7,12 +7,12 @@
 # They call the fallback module directly, so they also run where mslk exists.
 
 import functools
-import importlib.util
 import math
 from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import pytest
 import torch
+from xformers.ops.fmha import _backend
 from xformers.ops.fmha._fallback import attn_bias as fb, sdpa
 
 # ---------------------------------------------------------------------------
@@ -543,8 +543,8 @@ def test_backward_op_not_implemented():
 # ---------------------------------------------------------------------------
 
 _mslk_missing = pytest.mark.skipif(
-    importlib.util.find_spec("mslk") is not None,
-    reason="mslk is installed; public API routes to mslk, not the fallback",
+    _backend.FMHA_BACKEND == "mslk",
+    reason="mslk is in use; public API routes to mslk, not the fallback",
 )
 
 
@@ -592,3 +592,217 @@ def test_public_fmha_namespace():
     ):
         assert hasattr(fmha, name), name
     assert fmha.AttentionBias is fb.AttentionBias
+
+
+# ---------------------------------------------------------------------------
+# Block-diagonal fast path (per-block SDPA instead of a materialized mask)
+# ---------------------------------------------------------------------------
+
+_BD_CLASSES = [
+    "BlockDiagonalMask",
+    "BlockDiagonalCausalMask",
+    "BlockDiagonalCausalFromBottomRightMask",
+]
+
+
+class BDConfig(NamedTuple):
+    name: str
+    q_seqlens: List[int]
+    kv_seqlens: Optional[List[int]]
+    bottom_right_ok: bool = True  # every kv seqlen >= q seqlen
+
+
+_BD_CONFIGS = [
+    BDConfig("uneven", [7, 33, 24], None),
+    BDConfig("q!=kv", [7, 33, 24], [9, 20, 30], bottom_right_ok=False),
+    BDConfig("q<kv", [7, 33, 24], [9, 33, 30]),
+    BDConfig("many_equal", [16] * 12, [24] * 12),
+    # Same shapes in non-consecutive blocks: exercises the gather/stack path
+    BDConfig("interleaved", [5, 9, 5, 9, 5, 9], [7, 9, 7, 9, 7, 12]),
+    # A query block with no keys: its rows are fully masked
+    BDConfig("empty_kv", [4, 6, 3], [5, 0, 4], bottom_right_ok=False),
+    BDConfig("empty_q", [4, 0, 3], [5, 6, 4]),
+]
+_BD_CASES = [
+    pytest.param(cls_name, cfg, id=f"{cls_name}-{cfg.name}")
+    for cls_name in _BD_CLASSES
+    for cfg in _BD_CONFIGS
+    if cfg.bottom_right_ok or "BottomRight" not in cls_name
+]
+
+
+def _bd_bias(cls_name: str, cfg: BDConfig, device: str):
+    cls = getattr(fb, cls_name)
+    return cls.from_seqlens(cfg.q_seqlens, cfg.kv_seqlens, device=torch.device(device))
+
+
+def _ref_attention_safe(q, k, v, bias, grad_out):
+    """float32 reference with autograd where fully masked rows output 0."""
+    qr, kr, vr = (x.detach().float().cpu().requires_grad_(True) for x in (q, k, v))
+
+    def bhmk(x):
+        if x.ndim == 3:
+            x = x.unsqueeze(2)
+        elif x.ndim == 5:
+            x = x.reshape(x.shape[0], x.shape[1], -1, x.shape[-1])
+        return x.transpose(1, 2)
+
+    s = bhmk(qr) @ bhmk(kr).transpose(-1, -2) * (q.shape[-1] ** -0.5) + bias
+    lse = s.detach().logsumexp(-1)
+    masked = torch.isneginf(s).all(-1, keepdim=True)
+    attn = s.masked_fill(masked, 0).softmax(-1).masked_fill(masked, 0)
+    out = _from_bhmk(attn @ bhmk(vr), qr)
+    out.backward(grad_out.detach().float().cpu())
+    return out.detach(), lse, (qr.grad, kr.grad, vr.grad)
+
+
+def _run_fallback(q, k, v, bias, grad_out, dense: bool, monkeypatch, p=0.0):
+    """Returns (out, lse, (dq, dk, dv)) from the fast or the dense path."""
+    monkeypatch.setattr(sdpa, "_USE_BLOCK_DIAGONAL_PATH", not dense)
+    q, k, v = (x.detach().requires_grad_(True) for x in (q, k, v))
+    out = sdpa.memory_efficient_attention(q, k, v, attn_bias=bias, p=p)
+    out.backward(grad_out)
+    _, lse = sdpa.memory_efficient_attention_forward_requires_grad(
+        q, k, v, attn_bias=bias
+    )
+    return out.detach(), lse, (q.grad, k.grad, v.grad)
+
+
+def _check_bd_against(fast, other, dtype, msg, fully_masked=None):
+    out, lse, grads = fast
+    o_out, o_lse, o_grads = other
+    _assert_close(out, o_out, f"out vs {msg}", _FW_ATOL[dtype], _FW_RTOL[dtype])
+    assert torch.equal(torch.isneginf(lse.cpu()), torch.isneginf(o_lse.cpu()))
+    finite = torch.isfinite(o_lse.cpu())
+    lse_atol = 2e-4 if dtype == torch.float32 else 2e-2
+    _assert_close(
+        lse.cpu()[finite], o_lse.cpu()[finite], f"lse vs {msg}", lse_atol, 2e-4
+    )
+    for name, g, og in zip(("dq", "dk", "dv"), grads, o_grads):
+        assert g is not None and g.dtype == dtype, name
+        assert torch.isfinite(g).all(), f"{name} has NaN/inf"
+        _assert_close(g, og, f"{name} vs {msg}", _BW_ATOL[dtype], _BW_RTOL[dtype])
+
+
+@pytest.mark.parametrize("cls_name,cfg", _BD_CASES)
+@pytest.mark.parametrize("dtype", _DTYPES, ids=lambda d: str(d).split(".")[-1])
+@pytest.mark.parametrize("device", _DEVICES)
+def test_block_diagonal_fast_path(device, dtype, cls_name, cfg: BDConfig, monkeypatch):
+    _skip_if_unsupported(device, dtype)
+    torch.manual_seed(8)
+    bias = _bd_bias(cls_name, cfg, device)
+    Mq = sum(cfg.q_seqlens)
+    Mk = sum(cfg.kv_seqlens or cfg.q_seqlens)
+    q, k, v = _make_inputs("BMHK", 1, Mq, Mk, device, dtype, Kv=24)
+    grad_out = torch.randn([1, Mq, q.shape[2], 24]).to(dtype).to(device)
+    ref_bias = bias.materialize((1, q.shape[2], Mq, Mk), dtype=torch.float32)
+
+    fast = _run_fallback(q, k, v, bias, grad_out, False, monkeypatch)
+    dense = _run_fallback(q, k, v, bias, grad_out, True, monkeypatch)
+    ref = _ref_attention_safe(q, k, v, ref_bias, grad_out)
+    _check_bd_against(fast, ref, dtype, "reference")
+    _check_bd_against(fast, dense, dtype, "dense path")
+
+    # Fully masked rows: output exactly 0, lse -inf
+    masked_rows = torch.isneginf(ref_bias[0, 0]).all(-1)
+    if masked_rows.any():
+        out, lse, _ = fast
+        assert (out[0, masked_rows.to(out.device)] == 0).all()
+        assert torch.isneginf(lse[0, :, masked_rows.to(lse.device)]).all()
+
+
+@pytest.mark.parametrize("cls_name,cfg", _BD_CASES)
+@pytest.mark.parametrize("device", _DEVICES)
+def test_block_diagonal_fast_path_dropout_branch(device, cls_name, cfg, monkeypatch):
+    """p > 0 runs the explicit-softmax branch; with dropout replaced by the
+    identity it must match the reference exactly like p == 0."""
+    dtype = torch.float32
+    _skip_if_unsupported(device, dtype)
+    torch.manual_seed(9)
+    monkeypatch.setattr(
+        torch.nn.functional, "dropout", lambda x, p=0.5, training=True: x
+    )
+    bias = _bd_bias(cls_name, cfg, device)
+    Mq = sum(cfg.q_seqlens)
+    Mk = sum(cfg.kv_seqlens or cfg.q_seqlens)
+    q, k, v = _make_inputs("BMHK", 1, Mq, Mk, device, dtype)
+    grad_out = torch.randn([1, Mq, q.shape[2], q.shape[3]]).to(device)
+    ref_bias = bias.materialize((1, q.shape[2], Mq, Mk), dtype=torch.float32)
+
+    fast = _run_fallback(q, k, v, bias, grad_out, False, monkeypatch, p=0.3)
+    ref = _ref_attention_safe(q, k, v, ref_bias, grad_out)
+    _check_bd_against(fast, ref, dtype, "reference")
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_block_diagonal_fast_path_real_dropout(device):
+    _skip_if_unsupported(device, torch.float32)
+    torch.manual_seed(10)
+    bias = fb.BlockDiagonalCausalMask.from_seqlens([4, 6, 3], [5, 0, 4])
+    q, k, v = _make_inputs("BMHK", 1, 13, 9, device, torch.float32, requires_grad=True)
+    out = sdpa.memory_efficient_attention(q, k, v, attn_bias=bias, p=0.5)
+    out.sum().backward()
+    assert (out[0, 4:10] == 0).all()  # the block without keys
+    assert not torch.allclose(out, sdpa.memory_efficient_attention(q, k, v, bias))
+    for g in (q.grad, k.grad, v.grad):
+        assert torch.isfinite(g).all()
+
+
+@pytest.mark.parametrize("cls_name", _BD_CLASSES)
+@pytest.mark.parametrize("layout", ["BMK", "BMGHK", "BMGHK_expanded"])
+@pytest.mark.parametrize("device", _DEVICES)
+def test_block_diagonal_fast_path_layouts(device, layout, cls_name, monkeypatch):
+    dtype = torch.float32
+    _skip_if_unsupported(device, dtype)
+    torch.manual_seed(11)
+    cfg = _BD_CONFIGS[2]  # q<kv: valid for all three classes
+    bias = _bd_bias(cls_name, cfg, device)
+    Mq, Mk = sum(cfg.q_seqlens), sum(cfg.kv_seqlens)
+    q, k, v = _make_inputs(
+        layout.split("_")[0],
+        1,
+        Mq,
+        Mk,
+        device,
+        dtype,
+        Kv=24,
+        expand_kv=layout.endswith("expanded"),
+    )
+    grad_out = torch.randn([*q.shape[:-1], 24]).to(device)
+    H = _num_heads(q)
+    ref_bias = bias.materialize((1, H, Mq, Mk), dtype=torch.float32)
+
+    fast = _run_fallback(q, k, v, bias, grad_out, False, monkeypatch)
+    assert fast[1].shape == q.shape[:1] + q.shape[2:-1] + q.shape[1:2]
+    out_ref, lse_ref, grads_ref = _ref_attention_safe(q, k, v, ref_bias, grad_out)
+    lse_ref = lse_ref.reshape(fast[1].shape)
+    _check_bd_against(fast, (out_ref, lse_ref, grads_ref), dtype, "reference")
+
+
+def test_block_diagonal_fast_path_is_used(monkeypatch):
+    calls = []
+    real = sdpa._attention_block_diagonal
+
+    def spy(*args, **kwargs):
+        calls.append(type(args[3]).__name__)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sdpa, "_attention_block_diagonal", spy)
+    q, k, v = _make_inputs("BMHK", 1, 10, 10, "cpu", torch.float32)
+    for cls_name in _BD_CLASSES:
+        bias = getattr(fb, cls_name).from_seqlens([4, 6])
+        sdpa.memory_efficient_attention(q, k, v, attn_bias=bias)
+    # Subclasses with other semantics keep the dense path
+    local = fb.BlockDiagonalMask.from_seqlens([4, 6]).make_local_attention(2)
+    sdpa.memory_efficient_attention(q, k, v, attn_bias=local)
+    assert calls == _BD_CLASSES
+
+
+def test_block_diagonal_fast_path_errors():
+    bias = fb.BlockDiagonalMask.from_seqlens([4, 6])
+    q, k, v = _make_inputs("BMHK", 2, 10, 10, "cpu", torch.float32)
+    with pytest.raises(ValueError, match="batch size 1"):
+        sdpa.memory_efficient_attention(q, k, v, attn_bias=bias)
+    q, k, v = _make_inputs("BMHK", 1, 11, 10, "cpu", torch.float32)
+    with pytest.raises(ValueError, match="covers"):
+        sdpa.memory_efficient_attention(q, k, v, attn_bias=bias)
