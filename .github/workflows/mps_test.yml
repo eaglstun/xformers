@@ -53,7 +53,8 @@ jobs:
           python -m pytest -rs --timeout 600 \
             tests/test_fmha_sdpa_fallback.py \
             tests/test_fmha_backend_detection.py \
-            tests/test_tree_attention_fallback.py | tee pytest.log
+            tests/test_tree_attention_fallback.py \
+            tests/test_indexing_fallback.py | tee pytest.log
           if grep -iE "^SKIPPED .*mps" pytest.log; then
             echo "::error::MPS tests were skipped on the MPS runner"
             exit 1

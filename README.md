@@ -131,6 +131,7 @@ out = xops.memory_efficient_attention(q, q, q, attn_bias=fmha.attn_bias.LowerTri
   - The other biases are materialized as a dense `[Mq, Mk]` mask.
 - The BMK, BMHK and BMGHK layouts, custom `scale`, dropout (`p`), and value head dimensions that differ from the key's.
 - `xformers.ops.tree_attention` and `xformers.attn_bias_utils`.
+- `xformers.ops.scaled_index_add` and `xformers.ops.index_select_cat`, which fall back to plain PyTorch when Triton isn't available.
 
 **Not supported** (these raise `NotImplementedError` and need mslk):
 
@@ -138,6 +139,12 @@ out = xops.memory_efficient_attention(q, q, q, attn_bias=fmha.attn_bias.LowerTri
 - fp8 inputs and quantized KV caches
 - Triton split-K, including `tree_attention`'s `autotune` and `SplitKAutotune`
 - `memory_efficient_attention_backward` with dropout
+
+**Tested with real models** (on MPS, compared against PyTorch's native attention):
+- diffusers 0.40: a Stable Diffusion UNet and VAE through `XFormersAttnProcessor`, and Flux through `set_attention_backend("xformers")`, all matching exactly.
+- DINOv2: inference, including the nested-tensor path, which needs xFormers, and a training step with stochastic depth. The gradients match a plain-PyTorch reference.
+
+With diffusers on a Mac, use `model.set_attention_backend("xformers")`. The older `enable_xformers_memory_efficient_attention()` refuses to run on anything but CUDA; that check is in diffusers, not in xFormers.
 
 **Speed:** the fallback is as fast as PyTorch's SDPA on your device. It isn't a fused memory-efficient kernel, and biases that get materialized cost O(Mq·Mk) memory.
 

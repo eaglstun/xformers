@@ -13,6 +13,7 @@ on:
       - "tests/test_fmha_sdpa_fallback.py"
       - "tests/test_fmha_backend_detection.py"
       - "tests/test_tree_attention_fallback.py"
+      - "tests/test_indexing_fallback.py"
       - ".github/workflows/fallback_test.yml"
       - "setup.py"
       - "pyproject.toml"
@@ -79,3 +80,4 @@ jobs:
           tests/test_fmha_sdpa_fallback.py
           tests/test_fmha_backend_detection.py
           tests/test_tree_attention_fallback.py
+          tests/test_indexing_fallback.py

@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 import torch
 
@@ -40,6 +40,45 @@ class IndexSelect(BaseOperator):
     NAME = "index_select"
 
 
+# Plain-PyTorch versions of the Triton kernels, used when Triton is not available
+# (always the case on macOS). They follow the kernels: compute in fp32, store in the
+# tensor's dtype, and assume the indices are unique.
+
+
+def _scaled_index_add_fwd_torch(
+    x: torch.Tensor,
+    index: torch.Tensor,
+    source: torch.Tensor,
+    scaling: Optional[torch.Tensor],
+    alpha: float,
+) -> None:
+    added = source.float()
+    if scaling is not None:
+        added = added * scaling.float()
+    rows = x.index_select(0, index).float() + alpha * added
+    x.index_copy_(0, index, rows.to(x.dtype))
+
+
+def _scaled_index_add_bwd_torch(
+    grad_output: torch.Tensor,
+    source: torch.Tensor,
+    scaling: Optional[torch.Tensor],
+    index: torch.Tensor,
+    alpha: float,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    grad_rows = alpha * grad_output.index_select(0, index).float()
+    if scaling is None:
+        return grad_rows.to(source.dtype), None
+    grad_source = (grad_rows * scaling.float()).to(source.dtype)
+    # The Triton kernel writes the unreduced [Bi, M, D] product and leaves the sum
+    # to [D] to autograd (which reduces gradients broadcast from an input's shape).
+    # Reduce here, in fp32, instead.
+    grad_scaling = grad_rows * source.float()
+    grad_scaling = grad_scaling.sum(dim=tuple(range(source.ndim - 1)))
+    grad_scaling = grad_scaling.to(scaling.dtype)
+    return grad_source, grad_scaling
+
+
 class _ScaledIndexAdd(torch.autograd.Function):
     @staticmethod
     # type: ignore
@@ -54,9 +93,7 @@ class _ScaledIndexAdd(torch.autograd.Function):
         if scaled_index_add_fwd is not None:
             scaled_index_add_fwd(x, index, source, scaling, alpha)
         else:
-            raise RuntimeError(
-                "Triton is needed for forward pass but it is not available!"
-            )
+            _scaled_index_add_fwd_torch(x, index, source, scaling, alpha)
 
         ctx.mark_dirty(x)
         ctx.save_for_backward(index, scaling, source)
@@ -68,6 +105,12 @@ class _ScaledIndexAdd(torch.autograd.Function):
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_output):
         index, scaling, source = ctx.saved_tensors
+        if scaled_index_add_bwd is None:
+            grad_source, grad_scaling = _scaled_index_add_bwd_torch(
+                grad_output, source, scaling, index, ctx.alpha
+            )
+            return grad_output, None, grad_source, grad_scaling, None
+
         grad_source = torch.empty_like(source)
         grad_scaling = (
             None
@@ -164,8 +207,13 @@ class _IndexSelectCat(torch.autograd.Function):
                     index,
                 )
             else:
-                raise RuntimeError(
-                    "Triton is needed for forward pass but it is not available!"
+                torch.index_select(
+                    source,
+                    0,
+                    index,
+                    out=output[
+                        processed_numel : processed_numel + num_indices * num_cols
+                    ].view([num_indices, num_cols]),
                 )
 
             processed_numel += num_indices * num_cols
@@ -204,9 +252,7 @@ class _IndexSelectCat(torch.autograd.Function):
                     grad_output_slice,
                 )
             else:
-                raise RuntimeError(
-                    "Triton is needed for backward pass but it is not available!"
-                )
+                grad_source_slice.index_copy_(0, index, grad_output_slice)
             gradients.append(grad_source_slice)
 
         return (*gradients, *([None] * len(gradients)))

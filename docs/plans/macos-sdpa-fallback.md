@@ -206,3 +206,27 @@ tree attention.
   `win_amd64`), so the requirement marker is now `sys_platform != "darwin"`.
 - README: the compile-era troubleshooting (NVCC, TORCH_CUDA_ARCH_LIST, ninja)
   is replaced by mslk-centric troubleshooting.
+
+---
+
+## Step 6 (2026-10-02): real-model validation
+
+Ran real model code on MPS against PyTorch's native attention (scratch venv,
+diffusers 0.40, DINOv2 from torch.hub with random weights):
+
+- diffusers: SD UNet + VAE via `XFormersAttnProcessor`, Flux via
+  `set_attention_backend("xformers")`, and the dispatcher's padding-mask,
+  4-D mask, causal, GQA and custom-scale cases in fp32/fp16/bf16 — all
+  identical (the fallback runs the same SDPA kernel; a spy confirmed 22 calls
+  went through it). `enable_xformers_memory_efficient_attention()` is blocked
+  by diffusers' own CUDA check — documented, not ours to fix.
+- DINOv2: found that `scaled_index_add` / `index_select_cat` required Triton
+  (never available on macOS). Added plain-PyTorch forward/backward fallbacks
+  in `xformers/ops/indexing.py` (the Triton backward returns an unreduced
+  `[Bi, M, D]` grad for `[D]` scaling and lets autograd sum it; the fallback
+  sums in fp32). Nested inference matches per-crop forward exactly; a nested
+  training step (uniform stochastic depth, as in DINOv2's default config)
+  matches a pure-autograd reference to 6e-11 relative over 174 grads.
+  With non-uniform drop path, DINOv2's nested training hits an autograd
+  in-place-on-split-view error that is device-independent (DINOv2 + autograd,
+  not the fallback).
