@@ -112,5 +112,7 @@ else:
         memory_efficient_attention_backward,
         memory_efficient_attention_forward,
         memory_efficient_attention_forward_requires_grad,
+        memory_efficient_attention_partial,
+        merge_attentions,
     )
     from .attn_bias import AttentionBias, BlockDiagonalMask, LowerTriangularMask

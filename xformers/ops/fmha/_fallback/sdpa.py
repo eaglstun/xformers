@@ -48,10 +48,13 @@ MPS, ...). Backward comes from autograd. Conventions:
 - ``memory_efficient_attention_backward`` recomputes the forward with
   autograd; it ignores ``output``/``lse`` and does not support ``p > 0``
   (the dropout mask cannot be replayed).
+- ``memory_efficient_attention_partial`` returns ``(out, lse)`` (``out``
+  float32 by default, like mslk) and ``merge_attentions`` combines such
+  partial results computed over disjoint keys/values; see their docstrings.
 """
 
 import math
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple, Union
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -173,9 +176,20 @@ def _bias_to_mask(
                 f"size 1 (sequences concatenated along M), got batch size {B}"
             )
         GH = math.prod(query.shape[2:-1])
+        mask_Mk = Mk
+        block_tables = getattr(attn_bias, "block_tables", None)
+        if block_tables is not None:
+            # Paged biases take the logical (unpaged) key length, and return a
+            # mask that only reaches the last page block_tables uses.
+            mask_Mk = block_tables.numel() * getattr(attn_bias, "page_size")
         mask = attn_bias.materialize(
-            (B, GH, Mq, Mk), dtype=query.dtype, device=query.device
+            (B, GH, Mq, mask_Mk), dtype=query.dtype, device=query.device
         )
+        if mask.shape[-1] < Mk:
+            # Keys in pages that no sequence uses are never attended to.
+            mask = torch.nn.functional.pad(
+                mask, (0, Mk - mask.shape[-1]), value=-math.inf
+            )
         return mask, False
     raise TypeError(f"Unsupported attn_bias type: {type(attn_bias)}")
 
@@ -449,3 +463,212 @@ def memory_efficient_attention_backward(
         out, _ = _attention(q, k, v, attn_bias, 0.0, scale, None)
         gq, gk, gv = torch.autograd.grad(out, (q, k, v), grad.to(out.dtype))
     return gq, gk, gv
+
+
+def memory_efficient_attention_partial(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: Optional[Union[torch.Tensor, Any]] = None,
+    p: float = 0.0,
+    scale: Optional[float] = None,
+    *,
+    op: Any = None,
+    output_dtype: Optional[torch.dtype] = None,
+    _allow_backward: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Attention against part of the keys/values: returns ``(out, lse)``.
+
+    Outputs of calls with the same query and disjoint keys/values can be
+    combined with :func:`merge_attentions` into the attention over all of them.
+    As in mslk, ``out`` is float32 by default (float64 for a float64 query);
+    here it is computed in the query dtype and then cast. ``lse`` is float32
+    with the same shape as in ``memory_efficient_attention_forward_requires_grad``
+    (for varlen ``BlockDiagonal*`` biases the packed ``[1, *GH, M]`` layout).
+    Rows without any visible key get ``out = 0`` and ``lse = -inf``.
+
+    There is no backward pass, unless ``_allow_backward=True``: then ``out``
+    is differentiable but ``lse`` is not, so only the gradient of ``out`` is
+    used. This makes it easy to get wrong gradients (as in mslk). Dropout is
+    not supported.
+    """
+    if p != 0.0:
+        raise NotImplementedError("dropout is not supported.")
+    _check_op(op)
+    if output_dtype is None:
+        output_dtype = torch.float64 if query.dtype is torch.float64 else torch.float32
+    is_grad = (
+        _allow_backward
+        and torch.is_grad_enabled()
+        and any(x.requires_grad for x in (query, key, value))
+    )
+    if not is_grad:
+        with torch.no_grad():
+            out, lse = _attention(
+                query, key, value, attn_bias, 0.0, scale, output_dtype, True
+            )
+    else:
+        if query.ndim == 5:
+            raise ValueError("gradients not supported for 5D tensors")
+        out, lse = _attention(
+            query, key, value, attn_bias, 0.0, scale, output_dtype, True
+        )
+    assert lse is not None
+    return out, lse
+
+
+def _merge(
+    attn_split: List[torch.Tensor],
+    lse_split: List[torch.Tensor],
+    write_lse: bool,
+    output_dtype: Optional[torch.dtype],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """attn_split: [B, M, G, H, Kq] each, lse_split: [B, G, H, M] each."""
+    acc_dtype = (
+        torch.float64
+        if any(x.dtype is torch.float64 for x in [*attn_split, *lse_split])
+        else torch.float32
+    )
+    # [B, G, H, M] -> [B, M, G, H]
+    lses = [x.to(acc_dtype).permute(0, 3, 1, 2) for x in lse_split]
+    lse_max = lses[0]
+    for lse in lses[1:]:
+        lse_max = torch.maximum(lse_max, lse)
+    # All chunks -inf: use 0 so the exps are exp(-inf) = 0, not NaN.
+    lse_max = lse_max.masked_fill(torch.isneginf(lse_max), 0.0)
+    numerator = torch.zeros(
+        attn_split[0].shape, dtype=acc_dtype, device=attn_split[0].device
+    )
+    sumexp = torch.zeros_like(lse_max)
+    for attn, lse in zip(attn_split, lses):
+        weight = torch.exp(lse - lse_max)
+        sumexp = sumexp + weight
+        numerator = numerator + attn.to(acc_dtype) * weight.unsqueeze(-1)
+    # Rows where every chunk is fully masked (sumexp == 0) output 0.
+    out = numerator / sumexp.masked_fill(sumexp == 0, 1.0).unsqueeze(-1)
+    out = out.to(output_dtype or attn_split[0].dtype)
+    lse_out = None
+    if write_lse:
+        # log(0) = -inf for fully masked rows
+        lse_out = (lse_max + torch.log(sumexp)).permute(0, 2, 3, 1)
+        lse_out = lse_out.to(lse_split[0].dtype)
+    return out, lse_out
+
+
+class _MergeAttentions(torch.autograd.Function):
+    """Lets merge_attentions run on inputs that require grad (like mslk);
+    the backward raises, as mslk's does."""
+
+    @staticmethod
+    # type: ignore
+    def forward(ctx, output_dtype, num_chunks, *tensors):
+        out, lse = _merge(
+            list(tensors[:num_chunks]), list(tensors[num_chunks:]), True, output_dtype
+        )
+        return out, lse
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_out, grad_lse):  # type: ignore[override]
+        raise NotImplementedError(
+            "Backward pass is not implemented for merge_attentions. "
+            "If it was, it would be easy to get wrong attention gradients, "
+            "because the gradients of the LSEs "
+            "don't get propagated by attention backward."
+        )
+
+
+def merge_attentions(
+    attn_split: Union[torch.Tensor, Sequence[torch.Tensor]],
+    lse_split: Union[torch.Tensor, Sequence[torch.Tensor]],
+    write_lse: bool = True,
+    output_dtype: Optional[torch.dtype] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Combine attention computed on disjoint parts of K/V for the same query.
+
+    ``Out = sum_i Out_i * exp(LSE_i) / sum_i exp(LSE_i)`` and
+    ``LSE = log(sum_i exp(LSE_i))``, accumulated in float32 (float64 if an
+    input is float64). Chunks with ``LSE = -inf`` contribute nothing; rows
+    where every chunk has ``LSE = -inf`` get ``Out = 0`` and ``LSE = -inf``.
+
+    Args:
+        attn_split: a list of ``[B, M, G, H, Kq]`` or ``[B, M, H, Kq]`` tensors,
+            or one stacked ``[num_chunks, B, M, (G,) H, Kq]`` tensor.
+        lse_split: a list of ``[B, G, H, M]`` or ``[B, H, M]`` tensors, or one
+            stacked ``[num_chunks, B, (G,) H, M]`` tensor.
+        write_lse: whether to return the merged LSE.
+        output_dtype: dtype of the merged output (default: the chunks' dtype).
+    Returns:
+        ``(out [B, M, (G,) H, Kq], lse [B, (G,) H, M] or None)``; ``lse`` has
+        the dtype of ``lse_split``.
+
+    As in mslk, inputs may require grad (then ``write_lse`` must be True), but
+    calling backward raises ``NotImplementedError``.
+    """
+    attn_is_concat = isinstance(attn_split, torch.Tensor)
+    lse_is_concat = isinstance(lse_split, torch.Tensor)
+    attn_list: List[torch.Tensor] = list(
+        attn_split.unbind(0)  # type: ignore[union-attr]
+        if attn_is_concat
+        else attn_split
+    )
+    lse_list: List[torch.Tensor] = list(
+        lse_split.unbind(0) if lse_is_concat else lse_split  # type: ignore[union-attr]
+    )
+    requires_grad = torch.is_grad_enabled() and any(
+        x.requires_grad for x in [*attn_list, *lse_list]
+    )
+    if requires_grad and not write_lse:
+        raise ValueError("write_lse should be true if inputs require gradients.")
+
+    num_chunks = len(attn_list)
+    if len(lse_list) != num_chunks:
+        raise ValueError(
+            "Incompatible number of LSE and attention chunks: "
+            f"{len(attn_list)=}, {len(lse_list)=}"
+        )
+    if num_chunks == 0:
+        raise ValueError("merge_attentions needs at least one chunk")
+
+    is_bmhk = attn_list[0].ndim == 4
+    for i in range(num_chunks):
+        if attn_list[i].ndim != lse_list[i].ndim + 1 or attn_list[i].ndim not in (
+            4,
+            5,
+        ):
+            raise ValueError(
+                f"Incompatible input shapes for chunk {i}: "
+                f"{attn_list[i].shape=}, {lse_list[i].shape=}"
+            )
+        if (attn_list[i].ndim == 4) != is_bmhk:
+            raise ValueError("All chunks must be either BMHK or BMGHK")
+        if is_bmhk:
+            attn_list[i] = attn_list[i].unsqueeze(2)
+            lse_list[i] = lse_list[i].unsqueeze(1)
+
+    B, M, G, H, Kq = attn_list[0].shape
+    for i in range(num_chunks):
+        if attn_list[i].shape != (B, M, G, H, Kq):
+            raise ValueError(
+                f"Incompatible input shapes for attention chunk {i}: "
+                f"{attn_list[i].shape=}, {(B, M, G, H, Kq)=}"
+            )
+        if lse_list[i].shape != (B, G, H, M):
+            raise ValueError(
+                f"Incompatible input shapes for LSE chunk {i}: "
+                f"{lse_list[i].shape=}, {(B, G, H, M)=}"
+            )
+
+    lse_out: Optional[torch.Tensor]
+    if requires_grad:
+        attn_out, lse_out = _MergeAttentions.apply(
+            output_dtype, num_chunks, *attn_list, *lse_list
+        )
+    else:
+        attn_out, lse_out = _merge(attn_list, lse_list, write_lse, output_dtype)
+
+    if is_bmhk:
+        attn_out = attn_out[:, :, 0]
+        if lse_out is not None:
+            lse_out = lse_out[:, 0]
+    return attn_out, lse_out

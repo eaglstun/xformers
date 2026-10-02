@@ -133,3 +133,38 @@ one shared check that actually imports `mslk.attention.fmha` and treats any
 exception as "no mslk" (the fallback warning includes the reason). Used by
 `xformers/ops/__init__.py`, `xformers/ops/fmha/__init__.py`,
 `xformers/ops/fmha/attn_bias.py` and `xformers/info.py`.
+
+---
+
+## Step 3 (2026-10-02): the remaining mslk-only modules
+
+Step 2 landed in 24701c04. Two modules still hard-import mslk:
+`xformers/attn_bias_utils.py` and `xformers/ops/tree_attention.py`.
+
+### 3a. `memory_efficient_attention_partial` and `merge_attentions`
+
+Add both to the SDPA fallback (`sdpa.py`), matching mslk 1.3.0 semantics:
+`partial` returns `(out, lse)` with no dropout and (by default) no backward;
+`merge_attentions` combines chunks via
+`Out = Σ Out_i·exp(LSE_i) / Σ exp(LSE_i)`, accepting lists or stacked
+tensors, BMHK and BMGHK, `write_lse`, `output_dtype`, and chunks where every
+key is masked (LSE `-inf`). Export both from `xformers.ops.fmha` and
+`xformers.ops` in fallback mode. These were "not provided" in step 1 and are
+generally useful (split-KV, ring/context-parallel attention), not just for
+tree attention.
+
+### 3b. Tree attention and attn_bias_utils
+
+- `attn_bias_utils`: vendor mslk 1.3.0's file into `_fallback/`, adapting only
+  the imports and the `triton_splitk` op checks.
+- `tree_attention`: vendor `TreeAttnMetadata`, the `_prepare_*` helpers,
+  `construct_*tree_choices`, `get_full_tree_size` and
+  `use_triton_splitk_for_prefix` unchanged. Reimplement `tree_attention()` on
+  the fallback's `partial` (prefix vs. KV cache) + `forward_requires_grad`
+  (suffix with the tree mask) + `merge_attentions`. Not supported: `prefix_op`
+  / `suffix_op` other than None, `autotune`, fp8/uint8 KV caches,
+  `SplitKAutotune` (it subclasses a Triton kernel).
+- `xformers/attn_bias_utils.py` and `xformers/ops/tree_attention.py` choose
+  mslk or the fallback via `xformers.ops.fmha._backend.HAS_MSLK`.
+- Tests compare `tree_attention` against a dense reference (full q over
+  `cat(cache, spec)` with the combined mask) on cpu and mps.

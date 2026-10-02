@@ -554,6 +554,10 @@ def test_public_api_routes_to_fallback():
     from xformers.ops.fmha import attn_bias as public_attn_bias
 
     assert hasattr(xops, "memory_efficient_attention")
+    assert xops.memory_efficient_attention_partial is (
+        sdpa.memory_efficient_attention_partial
+    )
+    assert xops.merge_attentions is sdpa.merge_attentions
     assert public_attn_bias.BlockDiagonalCausalMask is fb.BlockDiagonalCausalMask
     assert public_attn_bias.LowerTriangularMask is fb.LowerTriangularMask
     assert xops.LowerTriangularMask is fb.LowerTriangularMask
@@ -586,6 +590,8 @@ def test_public_fmha_namespace():
         "memory_efficient_attention_forward",
         "memory_efficient_attention_forward_requires_grad",
         "memory_efficient_attention_backward",
+        "memory_efficient_attention_partial",
+        "merge_attentions",
         "AttentionBias",
         "LowerTriangularMask",
         "BlockDiagonalMask",
@@ -806,3 +812,277 @@ def test_block_diagonal_fast_path_errors():
     q, k, v = _make_inputs("BMHK", 1, 11, 10, "cpu", torch.float32)
     with pytest.raises(ValueError, match="covers"):
         sdpa.memory_efficient_attention(q, k, v, attn_bias=bias)
+
+
+# ---------------------------------------------------------------------------
+# memory_efficient_attention_partial / merge_attentions
+# ---------------------------------------------------------------------------
+
+_LSE_ATOL = {torch.float32: 2e-4, torch.float16: 2e-2, torch.bfloat16: 2e-2}
+
+
+def _lse_shape(q: torch.Tensor) -> Tuple[int, ...]:
+    return tuple(q.shape[:1] + q.shape[2:-1] + q.shape[1:2])
+
+
+def _check_lse(lse, ref_lse, dtype, msg="lse"):
+    lse, ref_lse = lse.float().cpu(), ref_lse.reshape(lse.shape).float().cpu()
+    assert torch.equal(torch.isneginf(lse), torch.isneginf(ref_lse)), msg
+    finite = torch.isfinite(ref_lse)
+    _assert_close(lse[finite], ref_lse[finite], msg, _LSE_ATOL[dtype], 2e-4)
+
+
+@pytest.mark.parametrize(
+    "bias_name", ["none", "causal_mq<mk", "tensor", "blockdiag_causal_qkv"]
+)
+@pytest.mark.parametrize("dtype", _DTYPES, ids=lambda d: str(d).split(".")[-1])
+@pytest.mark.parametrize("device", _DEVICES)
+def test_partial_matches_reference(device, dtype, bias_name):
+    _skip_if_unsupported(device, dtype)
+    torch.manual_seed(20)
+    case = _BIAS_BY_NAME[bias_name]
+    q, k, v = _make_inputs("BMHK", case.B, case.Mq, case.Mk, device, dtype, Kv=24)
+    bias, ref_bias = _make_bias(case, q, case.Mq, case.Mk, device, dtype)
+    out, lse = sdpa.memory_efficient_attention_partial(q, k, v, attn_bias=bias)
+    # Like mslk: float32 output by default, float32 LSE in the packed layout
+    assert out.dtype == torch.float32 and out.shape == (*q.shape[:-1], 24)
+    assert lse.dtype == torch.float32 and tuple(lse.shape) == _lse_shape(q)
+    assert not out.requires_grad
+    _assert_close(
+        out, _ref_attention(q, k, v, ref_bias), "out", _FW_ATOL[dtype], _FW_RTOL[dtype]
+    )
+    _check_lse(lse, _ref_scores(q, k, ref_bias, None).logsumexp(-1), dtype)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_partial_output_dtype(device):
+    _skip_if_unsupported(device, torch.float16)
+    torch.manual_seed(21)
+    q, k, v = _make_inputs("BMHK", 2, 5, 7, device, torch.float16)
+    out, lse = sdpa.memory_efficient_attention_partial(
+        q, k, v, output_dtype=torch.float16
+    )
+    assert out.dtype == torch.float16 and lse.dtype == torch.float32
+    _assert_close(
+        out, _ref_attention(q, k, v, None), "out", _FW_ATOL[torch.float16], 4e-4
+    )
+    if device == "cpu":
+        q, k, v = (x.double() for x in (q, k, v))
+        out, _ = sdpa.memory_efficient_attention_partial(q, k, v)
+        assert out.dtype == torch.float64
+
+
+def _split_bounds(Mk: int, n: int) -> List[Tuple[int, int]]:
+    edges = [round(i * Mk / n) for i in range(n + 1)]
+    return list(zip(edges[:-1], edges[1:]))
+
+
+@pytest.mark.parametrize("stacked", [False, True], ids=["list", "stacked"])
+@pytest.mark.parametrize("num_chunks", [2, 3])
+@pytest.mark.parametrize("layout", ["BMHK", "BMGHK"])
+@pytest.mark.parametrize("dtype", _DTYPES, ids=lambda d: str(d).split(".")[-1])
+@pytest.mark.parametrize("device", _DEVICES)
+def test_split_kv_merge(device, dtype, layout, num_chunks, stacked):
+    """Causal attention over 12 keys, split into chunks with a bias each: the
+    later chunks have fully masked rows (the early queries see none of their
+    keys). Merging must give the full attention and its LSE."""
+    _skip_if_unsupported(device, dtype)
+    torch.manual_seed(22)
+    B, M = 2, 12
+    q, k, v = _make_inputs(layout, B, M, M, device, dtype, Kv=24)
+    ref_bias = _causal_mask_ref(M, M)
+    outs, lses = [], []
+    for i, (a, b) in enumerate(_split_bounds(M, num_chunks)):
+        if i == 0:
+            # top-left causal on keys [0, b) is the full causal mask restricted
+            bias: object = fb.LowerTriangularMask()
+        else:
+            bias = ref_bias[:, a:b].to(dtype).to(device)
+        out, lse = sdpa.memory_efficient_attention_partial(
+            q, k[:, a:b], v[:, a:b], attn_bias=bias
+        )
+        assert torch.isneginf(lse[..., :a]).all()  # fully masked rows
+        assert (out[:, :a] == 0).all()
+        outs.append(out)
+        lses.append(lse)
+    if stacked:
+        merged, lse = sdpa.merge_attentions(torch.stack(outs), torch.stack(lses))
+    else:
+        merged, lse = sdpa.merge_attentions(outs, lses)
+    assert merged.dtype == torch.float32 and merged.shape == outs[0].shape
+    assert lse is not None and lse.dtype == torch.float32 and lse.shape == lses[0].shape
+    assert torch.isfinite(merged).all()
+    _assert_close(
+        merged,
+        _ref_attention(q, k, v, ref_bias),
+        "merged",
+        _FW_ATOL[dtype],
+        _FW_RTOL[dtype],
+    )
+    _check_lse(lse, _ref_scores(q, k, ref_bias, None).logsumexp(-1), dtype)
+
+    merged2, no_lse = sdpa.merge_attentions(
+        outs, lses, write_lse=False, output_dtype=dtype
+    )
+    assert no_lse is None and merged2.dtype == dtype
+    _assert_close(merged2, merged, "write_lse=False", _FW_ATOL[dtype], 0)
+
+
+@pytest.mark.parametrize("dtype", _DTYPES, ids=lambda d: str(d).split(".")[-1])
+@pytest.mark.parametrize("device", _DEVICES)
+def test_split_kv_merge_block_diagonal(device, dtype):
+    """Varlen: each sequence's keys split in two; chunk 1 has an empty part for
+    one sequence (fully masked rows). Uses the packed [1, H, M] LSE layout."""
+    _skip_if_unsupported(device, dtype)
+    torch.manual_seed(23)
+    q_lens, kv1, kv2 = [5, 7, 3], [4, 6, 2], [3, 0, 5]
+    kv_full = [a + b for a, b in zip(kv1, kv2)]
+    q, k, v = _make_inputs("BMHK", 1, sum(q_lens), sum(kv_full), device, dtype)
+    starts = [0]
+    for n in kv_full:
+        starts.append(starts[-1] + n)
+
+    def pick(x, part):
+        pieces = []
+        for s, a, b in zip(starts, kv1, kv2):
+            pieces.append(x[:, s : s + a] if part == 0 else x[:, s + a : s + a + b])
+        return torch.cat(pieces, dim=1)
+
+    outs, lses = [], []
+    for part, lens in enumerate((kv1, kv2)):
+        bias = fb.BlockDiagonalMask.from_seqlens(
+            q_lens, lens, device=torch.device(device)
+        )
+        out, lse = sdpa.memory_efficient_attention_partial(
+            q, pick(k, part), pick(v, part), attn_bias=bias
+        )
+        assert tuple(lse.shape) == (1, q.shape[2], sum(q_lens))
+        outs.append(out)
+        lses.append(lse)
+    assert torch.isneginf(lses[1][:, :, 5:12]).all()
+
+    merged, lse = sdpa.merge_attentions(outs, lses)
+    full_bias = fb.BlockDiagonalMask.from_seqlens(q_lens, kv_full)
+    ref_bias = full_bias.materialize(
+        (1, q.shape[2], sum(q_lens), sum(kv_full)), dtype=torch.float32
+    )
+    _assert_close(
+        merged,
+        _ref_attention(q, k, v, ref_bias),
+        "merged",
+        _FW_ATOL[dtype],
+        _FW_RTOL[dtype],
+    )
+    _check_lse(lse, _ref_scores(q, k, ref_bias, None).logsumexp(-1), dtype)
+
+
+@pytest.mark.parametrize("layout", ["BMHK", "BMGHK"])
+@pytest.mark.parametrize("device", _DEVICES)
+def test_merge_fully_masked(device, layout):
+    """A chunk whose keys are all masked, and rows masked in every chunk."""
+    _skip_if_unsupported(device, torch.float32)
+    torch.manual_seed(24)
+    q, k, v = _make_inputs(layout, 1, 6, 8, device, torch.float32)
+    lse_shape = _lse_shape(q)
+    ninf = torch.full(lse_shape, -math.inf, device=device)
+    out_a, lse_a = sdpa.memory_efficient_attention_partial(q, k, v)
+    # chunk b: everything masked
+    out_b = torch.zeros_like(out_a)
+    merged, lse = sdpa.merge_attentions([out_a, out_b], [lse_a, ninf])
+    torch.testing.assert_close(merged, out_a)
+    torch.testing.assert_close(lse, lse_a)
+    # every chunk masked: 0 output, -inf LSE, no NaN
+    merged, lse = sdpa.merge_attentions([out_b, out_b], [ninf, ninf.clone()])
+    assert (merged == 0).all() and torch.isneginf(lse).all()
+
+
+def test_merge_errors_and_autograd():
+    q, k, v = _make_inputs("BMHK", 1, 4, 6, "cpu", torch.float32)
+    out, lse = sdpa.memory_efficient_attention_partial(q, k, v)
+    with pytest.raises(ValueError, match="number of LSE"):
+        sdpa.merge_attentions([out, out], [lse])
+    with pytest.raises(ValueError):
+        sdpa.merge_attentions([out], [lse[0]])
+    with pytest.raises(ValueError):
+        sdpa.merge_attentions([out, out[:, :2]], [lse, lse[..., :2]])
+
+    # Like mslk: inputs may require grad (with write_lse), backward raises
+    out = out.clone().requires_grad_(True)
+    with pytest.raises(ValueError, match="write_lse"):
+        sdpa.merge_attentions([out, out], [lse, lse], write_lse=False)
+    merged, merged_lse = sdpa.merge_attentions([out, out], [lse, lse])
+    assert merged.requires_grad
+    torch.testing.assert_close(merged.detach(), out.detach())
+    torch.testing.assert_close(merged_lse, lse + math.log(2))
+    with pytest.raises(NotImplementedError, match="merge_attentions"):
+        merged.sum().backward()
+
+
+def test_partial_errors():
+    q, k, v = _make_inputs("BMHK", 1, 4, 4, "cpu", torch.float32)
+    with pytest.raises(NotImplementedError, match="dropout"):
+        sdpa.memory_efficient_attention_partial(q, k, v, p=0.1)
+    with pytest.raises(NotImplementedError):
+        sdpa.memory_efficient_attention_partial(q, k, v, op=object())
+    q, k, v = _make_inputs("BMGHK", 1, 4, 4, "cpu", torch.float32, requires_grad=True)
+    with pytest.raises(ValueError, match="5D"):
+        sdpa.memory_efficient_attention_partial(q, k, v, _allow_backward=True)
+    # without _allow_backward: no graph, even for inputs requiring grad
+    out, lse = sdpa.memory_efficient_attention_partial(q, k, v)
+    assert not out.requires_grad and not lse.requires_grad
+
+
+@pytest.mark.parametrize("bias_name", ["none", "causal_mq<mk", "blockdiag_causal_qkv"])
+@pytest.mark.parametrize("layout", ["BMK", "BMHK"])
+@pytest.mark.parametrize("device,dtype", _BW_CONFIGS)
+def test_partial_allow_backward(device, dtype, layout, bias_name):
+    """With _allow_backward, `out` is differentiable (the LSE is not): over all
+    the keys, its grads are those of full attention."""
+    _skip_if_unsupported(device, dtype)
+    torch.manual_seed(25)
+    case = _BIAS_BY_NAME[bias_name]
+    q, k, v = _make_inputs(
+        layout, case.B, case.Mq, case.Mk, device, dtype, requires_grad=True
+    )
+    bias, ref_bias = _make_bias(case, q, case.Mq, case.Mk, device, dtype)
+    out, lse = sdpa.memory_efficient_attention_partial(
+        q, k, v, attn_bias=bias, _allow_backward=True
+    )
+    assert out.requires_grad and not lse.requires_grad
+    assert out.dtype == torch.float32
+    grad_out = torch.randn(out.shape).to(device)
+    out.backward(grad_out)
+    ref_out, rdq, rdk, rdv = _ref_attention_autograd(q, k, v, ref_bias, None, grad_out)
+    _assert_close(out, ref_out, "out", _FW_ATOL[dtype], _FW_RTOL[dtype])
+    for name, g, rg in (("dq", q.grad, rdq), ("dk", k.grad, rdk), ("dv", v.grad, rdv)):
+        assert g is not None and g.dtype == dtype, name
+        _assert_close(g, rg, name, _BW_ATOL[dtype], _BW_RTOL[dtype])
+
+
+@pytest.mark.parametrize("n_pages", [4, 6], ids=["exact_fit", "spare_pages"])
+@pytest.mark.parametrize("device", _DEVICES)
+def test_paged_bias_matches_page_gather(device: str, n_pages: int) -> None:
+    """Paged biases take the logical key length in materialize() and the
+    physical K/V cache may hold pages that block_tables never uses."""
+    _skip_if_unsupported(device, torch.float32)
+    torch.manual_seed(0)
+    page, B, Mq, H, D = 16, 2, 3, 4, 32
+    kv_lens = [20, 9]
+    block_tables = torch.tensor([[0, 3], [2, 1]], dtype=torch.int32, device=device)
+    q = torch.randn(1, B * Mq, H, D, device=device)
+    k = torch.randn(1, n_pages * page, H, D, device=device)
+    v = torch.randn_like(k)
+    bias = fb.BlockDiagonalPaddedKeysMask.from_seqlens(
+        [Mq] * B, kv_padding=2 * page, kv_seqlen=kv_lens
+    ).make_paged(block_tables, page, paged_type=fb.PagedBlockDiagonalPaddedKeysMask)
+    out = sdpa.memory_efficient_attention(q, k, v, attn_bias=bias)
+
+    refs = []
+    for b in range(B):
+        pages = [int(p) for p in block_tables[b]]
+        kk = torch.cat([k[0, p * page : (p + 1) * page] for p in pages])
+        vv = torch.cat([v[0, p * page : (p + 1) * page] for p in pages])
+        kk, vv = kk[: kv_lens[b]], vv[: kv_lens[b]]
+        scores = torch.einsum("mhd,nhd->hmn", q[0, b * Mq : (b + 1) * Mq], kk)
+        refs.append(torch.einsum("hmn,nhd->mhd", (scores / D**0.5).softmax(-1), vv))
+    _assert_close(out[0], torch.cat(refs), "out", 1e-5, 1e-5)

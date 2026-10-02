@@ -22,11 +22,13 @@ if _HAS_MSLK:
         memory_efficient_attention_backward,
         memory_efficient_attention_forward,
         memory_efficient_attention_forward_requires_grad,
+        memory_efficient_attention_partial,
         MemoryEfficientAttentionCkOp,
         MemoryEfficientAttentionCutlassFwdFlashBwOp,
         MemoryEfficientAttentionCutlassOp,
         MemoryEfficientAttentionFlashAttentionOp,
         MemoryEfficientAttentionSplitKCkOp,
+        merge_attentions,
     )
 else:
     from .fmha import (
@@ -37,6 +39,8 @@ else:
         memory_efficient_attention_backward,
         memory_efficient_attention_forward,
         memory_efficient_attention_forward_requires_grad,
+        memory_efficient_attention_partial,
+        merge_attentions,
     )
 
     logging.getLogger("xformers").warning(
@@ -114,6 +118,8 @@ __all__ = [
     "memory_efficient_attention_backward",
     "memory_efficient_attention_forward",
     "memory_efficient_attention_forward_requires_grad",
+    "memory_efficient_attention_partial",
+    "merge_attentions",
     # indexing
     "index_select_cat",
     "scaled_index_add",
