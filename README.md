@@ -19,7 +19,7 @@
 ---
 
 > **About this fork** ([eaglstun/xformers](https://github.com/eaglstun/xformers), branch `macos-support`):
-> upstream xFormers gets its attention kernels from the `mslk` package, which only ships for Linux with CUDA or ROCm.
+> upstream xFormers gets its attention kernels from the `mslk` package, which ships for Linux (CUDA, ROCm) and, for CUDA 13.0, Windows, but not for macOS.
 > Without it, `xformers.ops.memory_efficient_attention` used to be missing entirely.
 > This fork adds a fallback built on PyTorch's `scaled_dot_product_attention`, so the attention API works on macOS (Apple Silicon, MPS) and on CPU.
 > See [Running without mslk](#running-without-mslk-macos-cpu) below.
@@ -54,15 +54,12 @@ pip3 install -U xformers --index-url https://download.pytorch.org/whl/rocm7.1
 pip install --pre -U xformers
 ```
 
-- **Install from source**: If you want to use with another version of PyTorch for instance (including nightly-releases)
+- **Install from source**: If you want to use with another version of PyTorch for instance (including nightly-releases). xFormers is pure Python, so nothing is compiled. The kernels come from `mslk`, which you install separately for your CUDA/ROCm version (see [Install troubleshooting](#install-troubleshooting)).
 
 ```bash
-# (Optional) Makes the build much faster
-pip install ninja
-# Set TORCH_CUDA_ARCH_LIST if running and building on different GPU types
 # NOTE: pytorch must already be installed!
-pip install -v --no-build-isolation -U git+https://github.com/facebookresearch/xformers.git@main#egg=xformers
-# (this can take dozens of minutes)
+# --no-build-isolation stops pip from downloading a second copy of PyTorch just to build xFormers
+pip install --no-build-isolation -U git+https://github.com/facebookresearch/xformers.git@main
 ```
 
 - **macOS (Apple Silicon) or CPU-only, from this fork**: xFormers is pure Python, so this installs in seconds. `mslk` is not installed (it isn't available for macOS), and the [SDPA fallback](#running-without-mslk-macos-cpu) is used instead.
@@ -148,11 +145,20 @@ Set `XFORMERS_FMHA_BACKEND=sdpa` to force the fallback even when mslk is install
 
 ### Install troubleshooting
 
-- NVCC and the current CUDA runtime match. Depending on your setup, you may be able to change the CUDA runtime with `module unload cuda; module load cuda/xx.x`, possibly also `nvcc`
-- the version of GCC that you're using matches the current NVCC capabilities
-- the `TORCH_CUDA_ARCH_LIST` env variable is set to the architectures that you want to support. A suggested setup (slow to build but comprehensive) is `export TORCH_CUDA_ARCH_LIST="6.0;6.1;6.2;7.0;7.2;7.5;8.0;8.6"`
-- If the build from source OOMs, it's possible to reduce the parallelism of ninja with `MAX_JOBS` (eg `MAX_JOBS=2`)
-- If getting error message `Filename longer than 260 characters` on Windows, make sure long paths are enabled at OS level, and also execute the command `git config --global core.longpaths true`
+xFormers itself is pure Python, so there's nothing to compile. Install problems almost always come down to `mslk`, the package that provides the attention kernels.
+
+**Start with `python -m xformers.info`.** Its `fmha.backend` line says whether the mslk kernels are in use (`mslk`) or the PyTorch [SDPA fallback](#running-without-mslk-macos-cpu) is (`sdpa-fallback`). If it's the fallback, `fmha.fallback_reason` says why. Importing `xformers.ops` also logs that reason as a one-line warning.
+
+- **`the 'mslk' package is not installed` on a CUDA or ROCm machine:** the `mslk` on PyPI is an empty `0.0.0` placeholder; the real builds are only on the PyTorch package indexes. Install the one that matches your PyTorch's CUDA version (`python -c "import torch; print(torch.version.cuda)"`):
+
+  ```bash
+  pip install -U mslk --extra-index-url https://download.pytorch.org/whl/cu128   # or cu126, cu130, rocm7.1, ...
+  ```
+
+- **`the 'mslk' package failed to import (...)`:** mslk is installed but its native library doesn't load. This is usually because it was built for a different PyTorch or CUDA version than the one installed. Reinstall it from the index that matches your PyTorch build (see above). The message in parentheses is the underlying import error.
+- **macOS:** mslk doesn't exist for macOS, and pip doesn't try to install it there. The fallback is expected; see [Running without mslk](#running-without-mslk-macos-cpu).
+- **Windows:** mslk has Windows builds only for CUDA 13.0 (`cu130`). With other CUDA versions, xFormers uses the fallback.
+- **Testing the fallback where mslk works:** set `XFORMERS_FMHA_BACKEND=sdpa`.
 
 ### License
 
