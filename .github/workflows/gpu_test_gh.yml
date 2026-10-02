@@ -35,6 +35,8 @@ jobs:
         python: [3.11]
 
     name: test_sm${{ matrix.gpu.sm }}
+    # The GPU runners only exist upstream; on forks the job would queue forever.
+    if: github.repository == 'facebookresearch/xformers'
     runs-on: ${{ matrix.gpu.runner }}
 
     timeout-minutes: 360

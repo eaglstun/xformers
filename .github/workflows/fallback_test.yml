@@ -1,0 +1,81 @@
+name: fallback_test
+
+# Tests the PyTorch SDPA fallback that xformers.ops.fmha uses when mslk is not
+# installed: natively on macOS (Apple Silicon, where mslk does not exist), and
+# on Linux with XFORMERS_FMHA_BACKEND=sdpa.
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "xformers/**"
+      - "!xformers/benchmarks/**"
+      - "tests/test_fmha_sdpa_fallback.py"
+      - "tests/test_fmha_backend_detection.py"
+      - "tests/test_tree_attention_fallback.py"
+      - ".github/workflows/fallback_test.yml"
+      - "setup.py"
+      - "pyproject.toml"
+      - "requirements.txt"
+  push:
+    branches:
+      - main
+      - macos-support
+
+jobs:
+  fallback_test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            python: "3.12"
+            force_sdpa: ""
+          - os: ubuntu-24.04
+            python: "3.10"
+            force_sdpa: "sdpa"
+
+    name: fallback_${{ matrix.os }}_py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      XFORMERS_FMHA_BACKEND: ${{ matrix.force_sdpa }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install PyTorch (CPU build on Linux)
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
+          else
+            pip install torch
+          fi
+      - name: Install xFormers
+        # No build isolation: pyproject.toml lists torch as a build requirement,
+        # and an isolated build would download a second (CUDA, on Linux) torch.
+        run: pip install --no-build-isolation -e .
+      - name: Install test tools
+        run: pip install "pytest==9.0.3" "pytest-timeout==2.3.1"
+      - name: Environment info
+        run: |
+          python -c "import torch; print('torch', torch.__version__, '| mps available:', torch.backends.mps.is_available())"
+          python -m xformers.info
+      - name: Check the fallback is in use
+        run: |
+          python - <<'PY'
+          import xformers.ops as xops
+          from xformers.ops import fmha
+          assert fmha.FMHA_BACKEND == "sdpa-fallback", fmha.FMHA_BACKEND
+          assert hasattr(xops, "memory_efficient_attention")
+          print("fmha backend:", fmha.FMHA_BACKEND)
+          PY
+      - name: Run fallback tests
+        run: >
+          python -m pytest -v --timeout 600
+          tests/test_fmha_sdpa_fallback.py
+          tests/test_fmha_backend_detection.py
+          tests/test_tree_attention_fallback.py

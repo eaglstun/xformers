@@ -3,6 +3,8 @@ exclude =
     .git
     ,.github/run-clang-format.py
     ,third_party
+    ,xformers/ops/fmha/_fallback/attn_bias.py
+    ,xformers/ops/fmha/_fallback/attn_bias_utils.py
 max-line-length = 140
 copyright-check = True
 select = E,F,W,C

@@ -12,3 +12,19 @@ line-length = 88
 
 [tool.usort]
 first_party_detection = false
+
+# Files vendored from mslk for the PyTorch SDPA fallback (used when mslk is
+# not installed). They are kept identical to mslk's, so our formatters and
+# type checker leave them alone.
+[tool.ufmt]
+excludes = [
+    "xformers/ops/fmha/_fallback/attn_bias.py",
+    "xformers/ops/fmha/_fallback/attn_bias_utils.py",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "xformers.ops.fmha._fallback.attn_bias",
+    "xformers.ops.fmha._fallback.attn_bias_utils",
+]
+ignore_errors = true

@@ -1,3 +1,8 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
+#
 # Vendored in part from the `mslk` package, version 1.3.0, file
 # `mslk/attention/fmha/tree_attention.py`, copied on 2026-10-02. mslk is
 # distributed under the BSD-3-Clause license, Copyright (c) Meta Platforms,

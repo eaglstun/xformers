@@ -168,3 +168,19 @@ tree attention.
   mslk or the fallback via `xformers.ops.fmha._backend.HAS_MSLK`.
 - Tests compare `tree_attention` against a dense reference (full q over
   `cat(cache, spec)` with the combined mask) on cpu and mps.
+
+---
+
+## Step 4 (2026-10-02): CI
+
+- `.github/workflows/fallback_test.yml`: runs the three fallback test files on
+  `macos-14` (Python 3.12, mslk absent) and `ubuntu-24.04` (Python 3.10, CPU
+  torch, `XFORMERS_FMHA_BACKEND=sdpa`). Installs with
+  `--no-build-isolation` so the build doesn't fetch a second torch.
+- `gpu_test_gh.yml`: guarded with `github.repository ==
+  'facebookresearch/xformers'`, since its GPU runners don't exist on forks.
+- The `linters` workflow runs `ufmt` and repo-wide `mypy`/`flake8` outside
+  pre-commit, so the verbatim-vendored `attn_bias.py`/`attn_bias_utils.py` are
+  excluded in `pyproject.toml` (`[tool.ufmt]`, `[[tool.mypy.overrides]]`) and
+  `.flake8`. `_fallback/tree_attention.py` is mostly rewritten, so it gets the
+  standard xformers header instead.
