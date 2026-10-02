@@ -28,10 +28,20 @@ if _HAS_MSLK := importlib.util.find_spec("mslk") is not None:
         MemoryEfficientAttentionSplitKCkOp,
     )
 else:
+    from .fmha import (
+        AttentionBias,
+        AttentionBias as AttentionMask,
+        LowerTriangularMask,
+        memory_efficient_attention,
+        memory_efficient_attention_backward,
+        memory_efficient_attention_forward,
+        memory_efficient_attention_forward_requires_grad,
+    )
+
     logging.getLogger("xformers").warning(
-        "WARNING[XFORMERS]: the 'mslk' package is not installed, so the attention ops are "
-        "unavailable.\n  xformers.ops.memory_efficient_attention and the related symbols "
-        "will not exist.\n  mslk is a dependency of this part of xFormers."
+        "WARNING[XFORMERS]: the 'mslk' package is not installed, so "
+        "xformers.ops.memory_efficient_attention uses a PyTorch SDPA fallback "
+        "(no op= selection, fewer features)."
     )
 from .indexing import index_select_cat, scaled_index_add
 
@@ -136,3 +146,9 @@ __all__ = [
     # .
     "masked_matmul",
 ]
+
+# Without mslk (or torch.distributed) some of the names above are not defined.
+for _name in list(__all__):
+    if _name not in globals():
+        __all__.remove(_name)
+del _name

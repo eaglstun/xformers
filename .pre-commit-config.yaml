@@ -1,4 +1,4 @@
-exclude: 'build|stubs'
+exclude: 'build|stubs|xformers/ops/fmha/_fallback/attn_bias.py'
 
 default_language_version:
     python: python3

@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import importlib.util
 from typing import Dict
 
 import torch
@@ -19,6 +20,10 @@ def get_features_status() -> Dict[str, str]:
         status_str = "available" if op.is_available() else "unavailable"
         features[f"{op.OPERATOR_CATEGORY}.{op.NAME}"] = status_str
     features["is_triton_available"] = str(_is_triton_available())
+    # Same check as xformers.ops.fmha uses to pick its backend.
+    features["fmha.backend"] = (
+        "mslk" if importlib.util.find_spec("mslk") is not None else "sdpa-fallback"
+    )
     return features
 
 

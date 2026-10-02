@@ -5,11 +5,16 @@
 
 # The fmha implementation has moved to the mslk package. This package and its
 # submodules re-export mslk symbols to preserve the xformers.ops.fmha API.
+# Without mslk (e.g. on macOS), a reduced API backed by PyTorch's
+# scaled_dot_product_attention is provided instead, see _fallback/sdpa.py.
 import importlib.util
 
 import torch
 
-if importlib.util.find_spec("mslk"):
+_HAS_MSLK = importlib.util.find_spec("mslk") is not None
+FMHA_BACKEND = "mslk" if _HAS_MSLK else "sdpa-fallback"
+
+if _HAS_MSLK:
     # flake8: noqa
     from mslk.attention.fmha import (
         _deserialize_bias,
@@ -103,3 +108,12 @@ if importlib.util.find_spec("mslk"):
         "CUDA",
         _memory_efficient_attention_forward_torch_wrapper_with_bias,
     )
+else:
+    from . import attn_bias
+    from ._fallback.sdpa import (
+        memory_efficient_attention,
+        memory_efficient_attention_backward,
+        memory_efficient_attention_forward,
+        memory_efficient_attention_forward_requires_grad,
+    )
+    from .attn_bias import AttentionBias, BlockDiagonalMask, LowerTriangularMask
