@@ -162,6 +162,17 @@ def _kv_heads_label(kv_heads: Optional[int]) -> str:
     return f"gqa{kv_heads}"
 
 
+# This test compares two PyTorch references, and only borrows ck's tolerances.
+# Without mslk (e.g. on macOS) there is no fmha.ck, so use the same values
+# (mslk 1.3.0, ck.FwOp).
+if hasattr(fmha, "ck"):
+    _CK_FW_ERROR_ATOL = fmha.ck.FwOp.ERROR_ATOL
+    _CK_FW_ERROR_RTOL = fmha.ck.FwOp.ERROR_RTOL
+else:
+    _CK_FW_ERROR_ATOL = {torch.float: 3e-4, torch.half: 6e-3, torch.bfloat16: 2.8e-2}
+    _CK_FW_ERROR_RTOL = {torch.float: 2e-5, torch.half: 3e-3, torch.bfloat16: 2e-2}
+
+
 @pytest.mark.parametrize("dtype", ["f32"])
 @pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
 @pytest.mark.parametrize("n_heads", [16])
@@ -217,6 +228,6 @@ def test_splitk_reference(
     assert_allclose(
         ref_out,
         splitk_out,
-        atol=fmha.ck.FwOp.ERROR_ATOL[dtype_],
-        rtol=fmha.ck.FwOp.ERROR_RTOL[dtype_],
+        atol=_CK_FW_ERROR_ATOL[dtype_],
+        rtol=_CK_FW_ERROR_RTOL[dtype_],
     )

@@ -4,19 +4,27 @@
 # LICENSE file in the root directory of this source tree.
 
 from functools import wraps
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import pytest
 import torch
 
 from xformers.attn_bias_utils import pack_kv_cache, ref_attention, ref_attention_bmhk
-from xformers.ops.fmha import Inputs
+from xformers.ops.fmha._backend import HAS_MSLK
 from xformers.ops.fmha.attn_bias import (
     BlockDiagonalCausalWithOffsetPaddedKeysMask,
     PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
 )
-from xformers.ops.fmha.triton_splitk import InputsFp8
+
+# Without mslk (e.g. on macOS), xformers.ops.fmha is the PyTorch SDPA fallback,
+# which has neither the operator Inputs nor fp8 attention. Only
+# construct_fp8_attention_inputs needs them.
+Inputs: Any = None
+InputsFp8: Any = None
+if HAS_MSLK:
+    from xformers.ops.fmha import Inputs
+    from xformers.ops.fmha.triton_splitk import InputsFp8
 
 cuda_or_mtia_only = pytest.mark.skipif(
     not torch.cuda.is_available() and not torch.mtia.is_available(),
@@ -142,13 +150,16 @@ def construct_fp8_attention_inputs(
     device: torch.device,
     dtype: torch.dtype,
     randomize_lengths: bool = True,
-) -> Tuple[InputsFp8, Inputs, InputsFp8, Inputs]:
+) -> Tuple[Any, Any, Any, Any]:
     """
     Construct inputs for benchmarks and tests of Triton Split-k attention
     with fused row-wise FP8 dequantization.
     Quantization coefficients are packed as int32 tensors where each
     element contains two fp16 numbers - scales and shifts.
+    Returns (InputsFp8, Inputs, InputsFp8, Inputs).
     """
+    if not HAS_MSLK:
+        pytest.skip("fp8 attention inputs need mslk")
     G = Hq // Hkv
     q = torch.randn(1, B * Mq, Hkv, G, K, dtype=dtype, device=device)
     k = torch.randn(1, B * Mkv, Hkv, 1, K, dtype=dtype, device=device)
